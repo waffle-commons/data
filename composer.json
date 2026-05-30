@@ -1,16 +1,16 @@
 {
-    "name": "waffle-commons/{COMPONENT_NAME}",
-    "description": "{COMPONENT_NAME} component for Waffle framework.",
+    "name": "waffle-commons/data",
+    "description": "Data component for Waffle framework.",
     "type": "library",
     "license": "MIT",
     "autoload": {
         "psr-4": {
-            "Waffle\\Commons\\{COMPONENT_NAME}\\": "src/"
+            "Waffle\\Commons\\Data\\": "src/"
         }
     },
     "autoload-dev": {
         "psr-4": {
-            "WaffleTests\\Commons\\{COMPONENT_NAME}\\": "tests/src/"
+            "WaffleTests\\Commons\\Data\\": "tests/src/"
         }
     },
     "authors": [

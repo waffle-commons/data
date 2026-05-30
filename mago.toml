@@ -1,4 +1,4 @@
-# Mago Configuration - Waffle Commons ({COMPONENT_NAME}, Beta 0)
+# Mago Configuration - Waffle Commons (Data, Beta 0)
 # For full documentation, see https://mago.carthage.software/tools/overview
 php-version = "8.5.5"
 
@@ -25,16 +25,16 @@ core = ["@global", "Psl\\**"]
 psr = ["Psr\\**"]
 
 [[guard.perimeter.rules]]
-namespace = "Waffle\\Commons\\{COMPONENT_NAME}"
+namespace = "Waffle\\Commons\\Data"
 permit = [
-    "Waffle\\Commons\\{COMPONENT_NAME}\\**",
+    "Waffle\\Commons\\Data\\**",
     "Waffle\\Commons\\Contracts\\**",
     "@layer:core",
     "@layer:psr",
 ]
 
 [[guard.perimeter.rules]]
-namespace = "WaffleTests\\Commons\\{COMPONENT_NAME}"
+namespace = "WaffleTests\\Commons\\Data"
 permit = ["@all"]
 
 [[guard.structural.rules]]

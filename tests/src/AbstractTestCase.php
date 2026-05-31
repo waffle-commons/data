@@ -6,17 +6,4 @@ namespace WaffleTests\Commons\Data;
 
 use PHPUnit\Framework\TestCase as BaseTestCase;
 
-abstract class AbstractTestCase extends BaseTestCase
-{
-    #[\Override]
-    protected function setUp(): void
-    {
-        parent::setUp();
-    }
-
-    #[\Override]
-    protected function tearDown(): void
-    {
-        parent::tearDown();
-    }
-}
+abstract class AbstractTestCase extends BaseTestCase {}

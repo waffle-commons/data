@@ -22,6 +22,7 @@
     "minimum-stability": "stable",
     "require": {
         "php": "^8.5",
+        "ext-pdo": "*",
         "waffle-commons/contracts": "self.version"
     },
     "require-dev": {

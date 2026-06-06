@@ -6,9 +6,9 @@ namespace WaffleTests\Commons\Data\Query;
 
 use InvalidArgumentException;
 use PHPUnit\Framework\Attributes\CoversClass;
+use Waffle\Commons\Contracts\Data\Enum\Operator;
 use Waffle\Commons\Data\Query\Comparison;
 use Waffle\Commons\Data\Query\Criteria;
-use Waffle\Commons\Data\Query\Operator;
 use WaffleTests\Commons\Data\AbstractTestCase;
 
 #[CoversClass(Criteria::class)]

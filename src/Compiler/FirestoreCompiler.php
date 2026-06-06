@@ -4,12 +4,12 @@ declare(strict_types=1);
 
 namespace Waffle\Commons\Data\Compiler;
 
-use Waffle\Commons\Data\Query\Comparison;
-use Waffle\Commons\Data\Query\Operator;
-use Waffle\Commons\Data\Query\Query;
+use Waffle\Commons\Contracts\Data\Enum\Operator;
+use Waffle\Commons\Contracts\Data\Query\ComparisonInterface;
+use Waffle\Commons\Contracts\Data\Query\QueryInterface;
 
 /**
- * Compiles an SQR {@see Query} into a {@see CompiledFirestoreQuery} bound to an
+ * Compiles an SQR {@see QueryInterface} into a {@see CompiledFirestoreQuery} bound to an
  * isolated {@see FirestoreScope}.
  *
  * Firestore is a document store, not a relational engine. Following the
@@ -25,7 +25,7 @@ use Waffle\Commons\Data\Query\Query;
  */
 final class FirestoreCompiler
 {
-    public function compile(Query $query, FirestoreScope $scope): CompiledFirestoreQuery
+    public function compile(QueryInterface $query, FirestoreScope $scope): CompiledFirestoreQuery
     {
         $filters = [];
         $requiresInMemory = false;
@@ -54,7 +54,7 @@ final class FirestoreCompiler
     /**
      * A predicate is server-safe only when it is a single-value equality test.
      */
-    private function isServerSafe(Comparison $comparison): bool
+    private function isServerSafe(ComparisonInterface $comparison): bool
     {
         return $comparison->operator === Operator::Equal;
     }
@@ -62,7 +62,7 @@ final class FirestoreCompiler
     /**
      * @return array{field: string, op: string, value: int|float|string|bool|null}
      */
-    private function serverFilter(Comparison $comparison): array
+    private function serverFilter(ComparisonInterface $comparison): array
     {
         // Equality carries exactly one value (Criteria::eq); fall back to null
         // for a hand-built Comparison so a missing index can never surface.
@@ -76,7 +76,7 @@ final class FirestoreCompiler
     /**
      * @return list<array{field: string, direction: string}>
      */
-    private function orderings(Query $query): array
+    private function orderings(QueryInterface $query): array
     {
         $orderings = [];
         foreach ($query->orderings as $order) {

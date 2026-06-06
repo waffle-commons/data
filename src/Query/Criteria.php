@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Waffle\Commons\Data\Query;
 
 use InvalidArgumentException;
+use Waffle\Commons\Contracts\Data\Enum\Operator;
 
 /**
  * Static factory for {@see Comparison} predicates.

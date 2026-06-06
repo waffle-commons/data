@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Waffle\Commons\Data\Query;
 
 use InvalidArgumentException;
+use Waffle\Commons\Contracts\Data\Enum\Direction;
+use Waffle\Commons\Contracts\Data\Query\QueryInterface;
 
 /**
  * Immutable, compiler-agnostic Abstract Syntax Tree for a read query.
@@ -16,7 +18,7 @@ use InvalidArgumentException;
  * copy-on-write, so a Query is safe to reuse across a resident worker without
  * any shared mutable state.
  */
-final class Query
+final class Query implements QueryInterface
 {
     /** @var list<string> */
     public private(set) array $fields = [];

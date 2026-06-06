@@ -23,7 +23,14 @@
     "require": {
         "php": "^8.5",
         "ext-pdo": "*",
+        "psr/http-client": "^1.0",
+        "psr/http-factory": "^1.0",
+        "psr/http-message": "^1.1 || ^2.0",
         "waffle-commons/contracts": "self.version"
+    },
+    "suggest": {
+        "ext-redis": "To execute key-value lookups live through the RedisKeyValueClient driver.",
+        "ext-mongodb": "To execute document queries live through the MongoDriverSession driver."
     },
     "require-dev": {
         "phpunit/phpunit": "^12.5",
@@ -58,10 +65,10 @@
             "@tests"
         ],
         "ci": [
-          "@mago",
-          "@tests",
-          "composer audit",
-          "vendor/bin/psalm --taint-analysis"
+            "@mago",
+            "@tests",
+            "composer audit",
+            "vendor/bin/psalm --taint-analysis"
         ]
     },
     "config": {

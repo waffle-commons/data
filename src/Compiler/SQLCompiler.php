@@ -5,8 +5,8 @@ declare(strict_types=1);
 namespace Waffle\Commons\Data\Compiler;
 
 use InvalidArgumentException;
-use Waffle\Commons\Data\Query\Comparison;
-use Waffle\Commons\Data\Query\Query;
+use Waffle\Commons\Contracts\Data\Query\ComparisonInterface;
+use Waffle\Commons\Contracts\Data\Query\QueryInterface;
 
 use function array_fill;
 use function array_map;
@@ -15,7 +15,7 @@ use function implode;
 use function sprintf;
 
 /**
- * Compiles an SQR {@see Query} into a parameterised {@see CompiledQuery}.
+ * Compiles an SQR {@see QueryInterface} into a parameterised {@see CompiledQuery}.
  *
  * Walking the AST node by node, the compiler emits a `?`-placeholder for every
  * literal and collects the literals separately, so no caller value is ever
@@ -32,7 +32,7 @@ final class SQLCompiler
      * @throws InvalidArgumentException When the query has no source table or a
      *                                  set predicate carries no values.
      */
-    public function compile(Query $query): CompiledQuery
+    public function compile(QueryInterface $query): CompiledQuery
     {
         [$where, $parameters] = $this->whereClause($query);
 
@@ -48,7 +48,7 @@ final class SQLCompiler
         return new CompiledQuery($sql, $parameters);
     }
 
-    private function projection(Query $query): string
+    private function projection(QueryInterface $query): string
     {
         if ($query->fields === []) {
             return '*';
@@ -60,7 +60,7 @@ final class SQLCompiler
     }
 
     /** @throws InvalidArgumentException When the query has no source table. */
-    private function source(Query $query): string
+    private function source(QueryInterface $query): string
     {
         if ($query->from === null) {
             throw new InvalidArgumentException('A SQL query requires a source table; call Query::from().');
@@ -74,7 +74,7 @@ final class SQLCompiler
      *
      * @throws InvalidArgumentException When a set predicate carries no values.
      */
-    private function whereClause(Query $query): array
+    private function whereClause(QueryInterface $query): array
     {
         $fragments = [];
         $parameters = [];
@@ -92,7 +92,7 @@ final class SQLCompiler
         return [' WHERE ' . implode(' AND ', $fragments), $parameters];
     }
 
-    private function orderClause(Query $query): string
+    private function orderClause(QueryInterface $query): string
     {
         if ($query->orderings === []) {
             return '';
@@ -111,7 +111,7 @@ final class SQLCompiler
      *
      * @throws InvalidArgumentException When a set predicate carries no values.
      */
-    private function predicate(Comparison $comparison): array
+    private function predicate(ComparisonInterface $comparison): array
     {
         $column = $this->dialect->quoteIdentifier($comparison->field);
         $operator = $comparison->operator;

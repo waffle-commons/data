@@ -29,6 +29,10 @@ namespace = "Waffle\\Commons\\Data"
 permit = [
     "Waffle\\Commons\\Data\\**",
     "Waffle\\Commons\\Contracts\\**",
+    # PHP's MongoDB driver extension lives in a namespaced (non-global) root;
+    # it is a backend driver dependency exactly like the global PDO/Redis
+    # classes, scoped to the Driver\Mongo adapter.
+    "MongoDB\\**",
     "@layer:core",
     "@layer:psr",
 ]
@@ -119,4 +123,16 @@ ignore = [
     # exceptions a test deliberately lets bubble to PHPUnit would otherwise force
     # a `@throws` tag on every single test — noise, not safety. Scoped to tests/.
     { code = "unhandled-thrown-type", in = ["tests/"] },
+    # These four files are the component's untyped-backend boundary —
+    # `json_decode()`, `PDOStatement::fetch()`, phpredis, and the GraphQL/Mongo
+    # wire payloads are `mixed` by signature. Every value is narrowed by an
+    # `is_array()` / `is_scalar()` / `is_string()` guard before any use, and a
+    # shape violation throws a DatabaseException (poisoned-row rejection), so
+    # the `mixed` never escapes these files.
+    { code = "mixed-assignment", in = [
+        "src/Hydrator/RowNormaliser.php",
+        "src/Driver/KeyValue/RedisKeyValueClient.php",
+        "src/Driver/Graph/GraphQLExecutor.php",
+        "src/Driver/Mongo/MongoDriverSession.php",
+    ] },
 ]

@@ -7,13 +7,13 @@ namespace WaffleTests\Commons\Data\Compiler;
 use InvalidArgumentException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
+use Waffle\Commons\Contracts\Data\Enum\Direction;
+use Waffle\Commons\Contracts\Data\Enum\Operator;
 use Waffle\Commons\Data\Compiler\CompiledQuery;
 use Waffle\Commons\Data\Compiler\SQLCompiler;
 use Waffle\Commons\Data\Compiler\SQLDialect;
 use Waffle\Commons\Data\Query\Comparison;
 use Waffle\Commons\Data\Query\Criteria;
-use Waffle\Commons\Data\Query\Direction;
-use Waffle\Commons\Data\Query\Operator;
 use Waffle\Commons\Data\Query\Query;
 use WaffleTests\Commons\Data\AbstractTestCase;
 
@@ -96,8 +96,11 @@ final class SQLCompilerTest extends AbstractTestCase
     public static function quotingProvider(): iterable
     {
         yield 'mysql backticks' => [SQLDialect::MySQL, 'SELECT `id` FROM `users`'];
+        yield 'mariadb backticks' => [SQLDialect::MariaDB, 'SELECT `id` FROM `users`'];
         yield 'sqlite double-quotes' => [SQLDialect::SQLite, 'SELECT "id" FROM "users"'];
         yield 'mssql brackets' => [SQLDialect::MSSQL, 'SELECT [id] FROM [users]'];
+        yield 'postgresql double-quotes' => [SQLDialect::PostgreSQL, 'SELECT "id" FROM "users"'];
+        yield 'oracle double-quotes' => [SQLDialect::Oracle, 'SELECT "id" FROM "users"'];
     }
 
     #[DataProvider('quotingProvider')]
@@ -116,10 +119,17 @@ final class SQLCompilerTest extends AbstractTestCase
         yield 'mysql limit+offset' => [SQLDialect::MySQL, 10, 20, ' LIMIT 10 OFFSET 20'];
         yield 'mysql limit only' => [SQLDialect::MySQL, 10, null, ' LIMIT 10'];
         yield 'mysql offset only' => [SQLDialect::MySQL, null, 5, ' LIMIT 18446744073709551615 OFFSET 5'];
+        yield 'mariadb offset only' => [SQLDialect::MariaDB, null, 5, ' LIMIT 18446744073709551615 OFFSET 5'];
         yield 'sqlite offset only' => [SQLDialect::SQLite, null, 5, ' LIMIT -1 OFFSET 5'];
         yield 'mssql limit+offset' => [SQLDialect::MSSQL, 10, 20, ' OFFSET 20 ROWS FETCH NEXT 10 ROWS ONLY'];
         yield 'mssql offset only' => [SQLDialect::MSSQL, null, 5, ' OFFSET 5 ROWS'];
         yield 'mssql limit only' => [SQLDialect::MSSQL, 10, null, ' OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY'];
+        yield 'postgresql limit+offset' => [SQLDialect::PostgreSQL, 10, 20, ' LIMIT 10 OFFSET 20'];
+        yield 'postgresql limit only' => [SQLDialect::PostgreSQL, 10, null, ' LIMIT 10'];
+        yield 'postgresql offset only' => [SQLDialect::PostgreSQL, null, 5, ' OFFSET 5'];
+        yield 'oracle limit+offset' => [SQLDialect::Oracle, 10, 20, ' OFFSET 20 ROWS FETCH NEXT 10 ROWS ONLY'];
+        yield 'oracle offset only' => [SQLDialect::Oracle, null, 5, ' OFFSET 5 ROWS'];
+        yield 'oracle limit only' => [SQLDialect::Oracle, 10, null, ' OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY'];
     }
 
     #[DataProvider('paginationProvider')]
@@ -174,8 +184,8 @@ final class SQLCompilerTest extends AbstractTestCase
     private function normaliseToMySqlQuoting(string $sql, SQLDialect $dialect): string
     {
         return match ($dialect) {
-            SQLDialect::MySQL => $sql,
-            SQLDialect::SQLite => str_replace('"', '`', $sql),
+            SQLDialect::MySQL, SQLDialect::MariaDB => $sql,
+            SQLDialect::SQLite, SQLDialect::PostgreSQL, SQLDialect::Oracle => str_replace('"', '`', $sql),
             SQLDialect::MSSQL => str_replace(['[', ']'], '`', $sql),
         };
     }

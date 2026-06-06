@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace Waffle\Commons\Data\Query;
 
+use Waffle\Commons\Contracts\Data\Enum\Operator;
+use Waffle\Commons\Contracts\Data\Query\ComparisonInterface;
+
 /**
  * A single, immutable filter predicate of the SQR: a field, an operator, and the
  * value(s) the field is compared against.
@@ -13,7 +16,7 @@ namespace Waffle\Commons\Data\Query;
  * parameter — the values are never interpolated into the query text, which is
  * what keeps the SQR injection-safe by construction.
  */
-final readonly class Comparison
+final readonly class Comparison implements ComparisonInterface
 {
     /** @var list<int|float|string|bool|null> */
     public array $values;

@@ -6,15 +6,14 @@ namespace WaffleTests\Commons\Data\Query;
 
 use InvalidArgumentException;
 use PHPUnit\Framework\Attributes\CoversClass;
+use Waffle\Commons\Contracts\Data\Enum\Direction;
 use Waffle\Commons\Data\Query\Criteria;
-use Waffle\Commons\Data\Query\Direction;
 use Waffle\Commons\Data\Query\Order;
 use Waffle\Commons\Data\Query\Query;
 use WaffleTests\Commons\Data\AbstractTestCase;
 
 #[CoversClass(Query::class)]
 #[CoversClass(Order::class)]
-#[CoversClass(Direction::class)]
 final class QueryTest extends AbstractTestCase
 {
     public function testSelectWithoutFieldsProjectsEverything(): void

@@ -10,13 +10,17 @@ use PDO;
 use PDOException;
 use PDOStatement;
 use Waffle\Commons\Contracts\Data\Connection\ConnectionPoolInterface;
+use Waffle\Commons\Contracts\Data\Mapper\DataMapperInterface;
 use Waffle\Commons\Contracts\Data\Query\QueryInterface;
-use Waffle\Commons\Contracts\Data\Repository\RepositoryInterface;
+use Waffle\Commons\Contracts\Data\Repository\WritableRepositoryInterface;
 use Waffle\Commons\Data\Compiler\CompiledQuery;
+use Waffle\Commons\Data\Compiler\CompiledWrite;
 use Waffle\Commons\Data\Compiler\SQLCompiler;
+use Waffle\Commons\Data\Compiler\SQLWriteCompiler;
 use Waffle\Commons\Data\Exception\DatabaseException;
 use Waffle\Commons\Data\Hydrator\PropertyHookHydrator;
 use Waffle\Commons\Data\Hydrator\RowNormaliser;
+use Waffle\Commons\Data\Query\Criteria;
 use Waffle\Commons\Data\Query\Query;
 
 use function is_bool;
@@ -37,27 +41,37 @@ use function is_int;
  *
  * @template T of object
  *
- * @implements RepositoryInterface<T>
+ * @implements WritableRepositoryInterface<T>
  */
-final class SQLRepository implements RepositoryInterface
+final class SQLRepository implements WritableRepositoryInterface
 {
     /** @var PropertyHookHydrator<T> */
     private readonly PropertyHookHydrator $hydrator;
 
     private readonly RowNormaliser $normaliser;
 
+    private readonly SQLWriteCompiler $writeCompiler;
+
     /**
-     * @param ConnectionPoolInterface $pool     Worker-safe PDO pool.
-     * @param class-string<T>         $target   `readonly` DTO each row hydrates into.
-     * @param SQLCompiler             $compiler Dialect-aware SQR compiler.
+     * @param ConnectionPoolInterface     $pool          Worker-safe PDO pool.
+     * @param class-string<T>             $target        `readonly` DTO each row hydrates into.
+     * @param SQLCompiler                 $compiler      Dialect-aware read (SELECT) compiler.
+     * @param DataMapperInterface<T>|null $mapper        Write/identity mapper; omit for a read-only
+     *                                                   repository (save / delete / findById then
+     *                                                   throw, the read methods keep working).
+     * @param SQLWriteCompiler|null       $writeCompiler Write compiler; SHOULD share the read
+     *                                                   compiler's dialect (defaults to MySQL).
      */
     public function __construct(
         private readonly ConnectionPoolInterface $pool,
         string $target,
         private readonly SQLCompiler $compiler = new SQLCompiler(),
+        private readonly ?DataMapperInterface $mapper = null,
+        ?SQLWriteCompiler $writeCompiler = null,
     ) {
         $this->hydrator = new PropertyHookHydrator($target);
         $this->normaliser = new RowNormaliser();
+        $this->writeCompiler = $writeCompiler ?? new SQLWriteCompiler();
     }
 
     /**
@@ -108,6 +122,59 @@ final class SQLRepository implements RepositoryInterface
         $bounded = $query instanceof Query ? $query->limit(1) : $query;
 
         return $this->find($bounded)[0] ?? null;
+    }
+
+    /**
+     * @throws InvalidArgumentException When the repository has no mapper, or an
+     *         INSERT row / UPDATE assignment set is empty.
+     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
+     */
+    #[\Override]
+    public function save(object $entity): void
+    {
+        $mapper = $this->requireMapper();
+        $id = $mapper->identify($entity);
+        $row = $mapper->toRow($entity);
+
+        $compiled = $id === null
+            ? $this->writeCompiler->compileInsert($mapper->target(), $row)
+            : $this->writeCompiler->compileUpdate($mapper->target(), $row, $mapper->identityField(), $id);
+
+        $this->executeWrite($compiled);
+    }
+
+    /**
+     * @throws InvalidArgumentException When the repository has no mapper, or the
+     *         entity carries no identity to delete by.
+     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
+     */
+    #[\Override]
+    public function delete(object $entity): void
+    {
+        $mapper = $this->requireMapper();
+        $id = $mapper->identify($entity);
+        if ($id === null) {
+            throw new InvalidArgumentException('Cannot delete an entity that carries no identity.');
+        }
+
+        $this->executeWrite($this->writeCompiler->compileDelete($mapper->target(), $mapper->identityField(), $id));
+    }
+
+    /**
+     * @return T|null
+     *
+     * @throws InvalidArgumentException When the repository has no mapper.
+     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
+     * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
+     */
+    #[\Override]
+    public function findById(int|string $id): ?object
+    {
+        $mapper = $this->requireMapper();
+
+        $query = Query::select()->from($mapper->target())->where(Criteria::eq($mapper->identityField(), $id))->limit(1);
+
+        return $this->find($query)[0] ?? null;
     }
 
     /**
@@ -176,6 +243,81 @@ final class SQLRepository implements RepositoryInterface
             return $statement;
         } catch (PDOException $error) {
             throw DatabaseException::fromThrowable($error, 'Failed to execute the compiled query.');
+        }
+    }
+
+    /**
+     * @return DataMapperInterface<T>
+     *
+     * @throws InvalidArgumentException When the repository was constructed read-only.
+     */
+    private function requireMapper(): DataMapperInterface
+    {
+        if ($this->mapper === null) {
+            throw new InvalidArgumentException(
+                'This SQLRepository was constructed without a DataMapper; write operations are unavailable.',
+            );
+        }
+
+        return $this->mapper;
+    }
+
+    /**
+     * Run a compiled mutation inside a transaction on a pooled connection,
+     * rolling back on failure and always returning the connection to the pool.
+     *
+     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
+     *         When the pool cannot dispense a connection, or the statement
+     *         cannot be prepared or executed.
+     */
+    private function executeWrite(CompiledWrite $compiled): void
+    {
+        $connection = $this->pool->acquire();
+
+        try {
+            $connection->beginTransaction();
+
+            $statement = $connection->prepare($compiled->sql);
+            if ($statement === false) {
+                throw new DatabaseException('Failed to prepare the compiled write.');
+            }
+
+            $position = 1;
+            foreach ($compiled->parameters as $value) {
+                $statement->bindValue($position, $value, $this->parameterType($value));
+                ++$position;
+            }
+
+            $statement->execute();
+            $connection->commit();
+        } catch (PDOException $error) {
+            $this->rollBack($connection);
+
+            throw DatabaseException::fromThrowable($error, 'Failed to execute the compiled write.');
+        } catch (DatabaseException $error) {
+            $this->rollBack($connection);
+
+            throw $error;
+        } finally {
+            $this->pool->release($connection);
+        }
+    }
+
+    /**
+     * Roll back an open transaction during write recovery (RFC-022 §6). A
+     * connection already severed mid-flight cannot roll back — it is left for
+     * the pool's ping-before-dispense / reset cycle to reap.
+     */
+    private function rollBack(PDO $connection): void
+    {
+        if (!$connection->inTransaction()) {
+            return;
+        }
+
+        try {
+            $connection->rollBack();
+        } catch (PDOException) {
+            // Connection is already broken; the pool reaps it on next dispense.
         }
     }
 

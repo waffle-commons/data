@@ -94,6 +94,29 @@ final class MongoDriverSessionTest extends AbstractTestCase
         self::assertSame(7.25, $carol?->score);
     }
 
+    public function testLiveWriteRoundTripThroughTheRepository(): void
+    {
+        $manager = $this->manager();
+        $this->seed($manager);
+
+        $session = new MongoDriverSession($manager, self::DATABASE);
+        $repository = new MongoRepository(
+            $session,
+            PersonRow::class,
+            mapper: new \WaffleTests\Commons\Data\Fixture\PersonMapper(),
+        );
+
+        // insert (null identity), upsert (replace by id), then delete.
+        $repository->save(new PersonRow(0, 'dave', 1.0));
+        self::assertInstanceOf(PersonRow::class, $repository->findById(1));
+
+        $repository->save(new PersonRow(1, 'alice-renamed', 2.0));
+        self::assertSame('alice-renamed', $repository->findById(1)?->name);
+
+        $repository->delete(new PersonRow(1, 'alice-renamed', 2.0));
+        self::assertNull($repository->findById(1));
+    }
+
     public function testDriverFailureIsWrappedAsDatabaseException(): void
     {
         $manager = $this->manager();

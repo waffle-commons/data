@@ -8,7 +8,8 @@ use Waffle\Commons\Data\Driver\KeyValue\KeyValueClientInterface;
 
 /**
  * Deterministic key-value transport over a plain array — a hit returns the
- * stored JSON document, a miss returns null, exactly like the live adapters.
+ * stored JSON document, a miss returns null, and `set`/`delete` mutate the same
+ * map so a save → findById round-trip behaves like a live store.
  */
 final class InMemoryKeyValueClient implements KeyValueClientInterface
 {
@@ -16,7 +17,7 @@ final class InMemoryKeyValueClient implements KeyValueClientInterface
      * @param array<string, string> $items
      */
     public function __construct(
-        private readonly array $items = [],
+        private array $items = [],
     ) {}
 
     #[\Override]
@@ -34,5 +35,17 @@ final class InMemoryKeyValueClient implements KeyValueClientInterface
         }
 
         return $values;
+    }
+
+    #[\Override]
+    public function set(string $key, string $value): void
+    {
+        $this->items[$key] = $value;
+    }
+
+    #[\Override]
+    public function delete(string $key): void
+    {
+        unset($this->items[$key]);
     }
 }

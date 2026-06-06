@@ -27,4 +27,33 @@ interface MongoSessionInterface
      *         When the backend call fails or a document is not a flat scalar row.
      */
     public function find(CompiledMongoQuery $query): array;
+
+    /**
+     * Insert a new document into the collection.
+     *
+     * @param array<string, int|float|string|bool|null> $row
+     *
+     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
+     *         When the backend call fails.
+     */
+    public function insert(string $collection, array $row): void;
+
+    /**
+     * Replace (upserting) the single document whose identity field equals `$id`.
+     *
+     * @param array<string, int|float|string|bool|null> $row
+     *
+     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
+     *         When the backend call fails.
+     */
+    public function upsert(string $collection, string $idField, int|string $id, array $row): void;
+
+    /**
+     * Delete the single document whose identity field equals `$id`. Deleting a
+     * missing document is a no-op.
+     *
+     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
+     *         When the backend call fails.
+     */
+    public function deleteOne(string $collection, string $idField, int|string $id): void;
 }

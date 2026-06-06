@@ -75,4 +75,42 @@ final class RedisKeyValueClientTest extends AbstractTestCase
 
         new RedisKeyValueClient($redis)->getMany(['a']);
     }
+
+    public function testSetStoresTheValue(): void
+    {
+        $redis = $this->createMock(Redis::class);
+        $redis->expects($this->once())->method('set')->with('people:1', '{"id":1}')->willReturn(true);
+
+        new RedisKeyValueClient($redis)->set('people:1', '{"id":1}');
+    }
+
+    public function testSetWrapsDriverFailures(): void
+    {
+        $redis = $this->createMock(Redis::class);
+        $redis->expects($this->once())->method('set')->willThrowException(new RedisException('socket gone'));
+
+        $this->expectException(DatabaseException::class);
+        $this->expectExceptionMessage('Redis SET failed.');
+
+        new RedisKeyValueClient($redis)->set('people:1', '{}');
+    }
+
+    public function testDeleteRemovesTheKey(): void
+    {
+        $redis = $this->createMock(Redis::class);
+        $redis->expects($this->once())->method('del')->with('people:1')->willReturn(1);
+
+        new RedisKeyValueClient($redis)->delete('people:1');
+    }
+
+    public function testDeleteWrapsDriverFailures(): void
+    {
+        $redis = $this->createMock(Redis::class);
+        $redis->expects($this->once())->method('del')->willThrowException(new RedisException('socket gone'));
+
+        $this->expectException(DatabaseException::class);
+        $this->expectExceptionMessage('Redis DEL failed.');
+
+        new RedisKeyValueClient($redis)->delete('people:1');
+    }
 }

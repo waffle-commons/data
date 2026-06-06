@@ -34,4 +34,15 @@ interface CqlSessionInterface
      *         When the backend call fails or a row is not a flat scalar map.
      */
     public function execute(CompiledCassandraQuery $query): array;
+
+    /**
+     * Execute a parameterised write statement (INSERT — an upsert in CQL — or
+     * DELETE). Operands are bound positionally, never inlined.
+     *
+     * @param list<int|float|string|bool|null> $parameters
+     *
+     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
+     *         When the backend call fails.
+     */
+    public function executeWrite(string $cql, array $parameters): void;
 }

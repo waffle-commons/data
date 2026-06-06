@@ -35,4 +35,20 @@ interface KeyValueClientInterface
      *         When the backend call fails.
      */
     public function getMany(array $keys): array;
+
+    /**
+     * Store a value at a key, creating or overwriting it (SET / PutItem).
+     *
+     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
+     *         When the backend call fails.
+     */
+    public function set(string $key, string $value): void;
+
+    /**
+     * Remove a key. Deleting a missing key is a no-op.
+     *
+     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
+     *         When the backend call fails.
+     */
+    public function delete(string $key): void;
 }

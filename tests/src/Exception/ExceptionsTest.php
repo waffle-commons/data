@@ -9,13 +9,19 @@ use PDOException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use RuntimeException;
 use Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface;
+use Waffle\Commons\Contracts\Data\Exception\SecurityPathViolationExceptionInterface;
+use Waffle\Commons\Contracts\Data\Exception\UnauthenticatedAccessExceptionInterface;
 use Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface;
 use Waffle\Commons\Data\Exception\DatabaseException;
+use Waffle\Commons\Data\Exception\SecurityPathViolationException;
+use Waffle\Commons\Data\Exception\UnauthenticatedAccessException;
 use Waffle\Commons\Data\Exception\ValidationException;
 use WaffleTests\Commons\Data\AbstractTestCase;
 
 #[CoversClass(DatabaseException::class)]
 #[CoversClass(ValidationException::class)]
+#[CoversClass(SecurityPathViolationException::class)]
+#[CoversClass(UnauthenticatedAccessException::class)]
 final class ExceptionsTest extends AbstractTestCase
 {
     public function testDatabaseExceptionExposesSqlState(): void
@@ -74,5 +80,23 @@ final class ExceptionsTest extends AbstractTestCase
     public function testValidationExceptionFieldDefaultsToNull(): void
     {
         self::assertNull(new ValidationException('bad')->getField());
+    }
+
+    public function testSecurityPathViolationIsADatabaseException(): void
+    {
+        $exception = new SecurityPathViolationException('root collection forbidden');
+
+        self::assertInstanceOf(SecurityPathViolationExceptionInterface::class, $exception);
+        self::assertInstanceOf(DatabaseExceptionInterface::class, $exception);
+        self::assertNull($exception->getSqlState());
+    }
+
+    public function testUnauthenticatedAccessIsADatabaseException(): void
+    {
+        $exception = new UnauthenticatedAccessException('auth required');
+
+        self::assertInstanceOf(UnauthenticatedAccessExceptionInterface::class, $exception);
+        self::assertInstanceOf(DatabaseExceptionInterface::class, $exception);
+        self::assertNull($exception->getSqlState());
     }
 }

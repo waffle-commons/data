@@ -10,6 +10,7 @@ use Psr\Http\Client\ClientExceptionInterface;
 use Psr\Http\Client\ClientInterface;
 use Psr\Http\Message\RequestFactoryInterface;
 use Psr\Http\Message\StreamFactoryInterface;
+use Waffle\Commons\Data\Compiler\CompiledGraphQLMutation;
 use Waffle\Commons\Data\Compiler\CompiledGraphQLQuery;
 use Waffle\Commons\Data\Exception\DatabaseException;
 use Waffle\Commons\Data\Hydrator\RowNormaliser;
@@ -80,6 +81,69 @@ final class GraphQLExecutor
         }
 
         return $this->rows((string) $response->getBody(), $compiled->root);
+    }
+
+    /**
+     * Execute a write mutation, asserting success. The mutation's return payload
+     * is intentionally ignored — only transport status and the GraphQL `errors`
+     * array decide success — so any provider's mutation return shape is accepted.
+     *
+     * @throws DatabaseException When the request cannot be encoded or sent, the
+     *         endpoint answers a non-200 status, or returns a GraphQL error.
+     */
+    public function mutate(CompiledGraphQLMutation $mutation): void
+    {
+        try {
+            $body = $mutation->toJson();
+        } catch (JsonException $error) {
+            throw DatabaseException::fromThrowable($error, 'Failed to encode the GraphQL mutation body.');
+        }
+
+        try {
+            $request = $this->requestFactory
+                ->createRequest('POST', $this->endpoint)
+                ->withHeader('Content-Type', 'application/json')
+                ->withHeader('Accept', 'application/json')
+                ->withBody($this->streamFactory->createStream($body));
+        } catch (InvalidArgumentException $error) {
+            throw DatabaseException::fromThrowable($error, 'Failed to build the GraphQL mutation request.');
+        }
+
+        try {
+            $response = $this->client->sendRequest($request);
+        } catch (ClientExceptionInterface $error) {
+            throw DatabaseException::fromThrowable($error, 'GraphQL transport failure.');
+        }
+
+        if ($response->getStatusCode() !== 200) {
+            throw new DatabaseException(sprintf('GraphQL endpoint answered HTTP %d.', $response->getStatusCode()));
+        }
+
+        $this->assertNoErrors((string) $response->getBody());
+    }
+
+    /**
+     * @throws DatabaseException When the envelope is malformed or carries a GraphQL error.
+     */
+    private function assertNoErrors(string $body): void
+    {
+        try {
+            $decoded = json_decode($body, true, flags: JSON_THROW_ON_ERROR);
+        } catch (JsonException $error) {
+            throw DatabaseException::fromThrowable($error, 'GraphQL response is not valid JSON.');
+        }
+
+        if (!is_array($decoded)) {
+            throw new DatabaseException('GraphQL response must be a JSON object.');
+        }
+
+        $errors = $decoded['errors'] ?? null;
+        if (is_array($errors) && $errors !== []) {
+            throw new DatabaseException(sprintf(
+                'GraphQL endpoint returned an error: %s',
+                $this->firstErrorMessage($errors),
+            ));
+        }
     }
 
     /**

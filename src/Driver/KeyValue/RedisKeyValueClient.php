@@ -16,8 +16,8 @@ use function is_string;
  * Live key-value adapter over the phpredis extension (`ext-redis`).
  *
  * The connected {@see Redis} handle is injected and held `readonly`: this class
- * keeps no mutable state of its own, issues only stateless `GET`/`MGET`
- * commands (no transactions, no subscriptions), and rethrows every driver
+ * keeps no mutable state of its own, issues only stateless `GET`/`MGET`/`SET`/
+ * `DEL` commands (no transactions, no subscriptions), and rethrows every driver
  * failure as a {@see DatabaseException} per the unified exception strategy
  * (RFC-022 §7.3).
  */
@@ -72,5 +72,31 @@ final class RedisKeyValueClient implements KeyValueClientInterface
         }
 
         return $byKey;
+    }
+
+    /**
+     * @throws DatabaseException When the Redis call fails.
+     */
+    #[\Override]
+    public function set(string $key, string $value): void
+    {
+        try {
+            $this->redis->set($key, $value);
+        } catch (RedisException $error) {
+            throw DatabaseException::fromThrowable($error, 'Redis SET failed.');
+        }
+    }
+
+    /**
+     * @throws DatabaseException When the Redis call fails.
+     */
+    #[\Override]
+    public function delete(string $key): void
+    {
+        try {
+            $this->redis->del($key);
+        } catch (RedisException $error) {
+            throw DatabaseException::fromThrowable($error, 'Redis DEL failed.');
+        }
     }
 }

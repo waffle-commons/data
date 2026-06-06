@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Waffle\Commons\Data\Driver\Mongo;
 
+use MongoDB\Driver\BulkWrite;
 use MongoDB\Driver\Exception\Exception as MongoDriverException;
 use MongoDB\Driver\Manager;
 use MongoDB\Driver\Query as MongoQuery;
@@ -54,6 +55,58 @@ final class MongoDriverSession implements MongoSessionInterface
         }
 
         return $this->normaliser->normaliseAll($documents);
+    }
+
+    /**
+     * @param array<string, int|float|string|bool|null> $row
+     *
+     * @throws DatabaseException When the write fails.
+     */
+    #[\Override]
+    public function insert(string $collection, array $row): void
+    {
+        $bulk = new BulkWrite();
+        $bulk->insert($row);
+
+        $this->commit($collection, $bulk, 'MongoDB insert failed.');
+    }
+
+    /**
+     * @param array<string, int|float|string|bool|null> $row
+     *
+     * @throws DatabaseException When the write fails.
+     */
+    #[\Override]
+    public function upsert(string $collection, string $idField, int|string $id, array $row): void
+    {
+        $bulk = new BulkWrite();
+        $bulk->update([$idField => $id], ['$set' => $row], ['upsert' => true]);
+
+        $this->commit($collection, $bulk, 'MongoDB upsert failed.');
+    }
+
+    /**
+     * @throws DatabaseException When the write fails.
+     */
+    #[\Override]
+    public function deleteOne(string $collection, string $idField, int|string $id): void
+    {
+        $bulk = new BulkWrite();
+        $bulk->delete([$idField => $id], ['limit' => 1]);
+
+        $this->commit($collection, $bulk, 'MongoDB delete failed.');
+    }
+
+    /**
+     * @throws DatabaseException When the bulk write fails.
+     */
+    private function commit(string $collection, BulkWrite $bulk, string $message): void
+    {
+        try {
+            $this->manager->executeBulkWrite($this->database . '.' . $collection, $bulk);
+        } catch (MongoDriverException $error) {
+            throw DatabaseException::fromThrowable($error, $message);
+        }
     }
 
     /**

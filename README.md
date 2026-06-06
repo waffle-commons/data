@@ -10,7 +10,7 @@
 Waffle Data Component
 =====================
 
-> **Release:** `v0.1.0-beta3` *(in progress)* &nbsp;|&nbsp; [`CHANGELOG.md`](./CHANGELOG.md)
+> **Release:** `0.1.0-beta3` &nbsp;|&nbsp; [`CHANGELOG.md`](./CHANGELOG.md)
 
 The data & persistence layer for the Waffle Framework (RFC-022). Built for FrankenPHP resident-worker mode: a warm connection pool, a backend-agnostic query AST, parameterized SQL / Firestore compilers, a property-hook hydrator, and a stateless SQL migration runner. **No stateful ORM, no identity map, no change tracking** — a row becomes an immutable value object and nothing more.
 
@@ -30,12 +30,18 @@ Requires PHP 8.5+ and `ext-pdo`. Depends only on `waffle-commons/contracts` (plu
 | `Waffle\Commons\Data\Query\Criteria` | Static factory for predicates: `eq`/`neq`/`gt`/`gte`/`lt`/`lte`/`like`/`in`/`notIn`. |
 | `Waffle\Commons\Data\Query\Query` | Immutable, copy-on-write query AST (`select` / `from` / `where` / `orderBy` / `limit` / `offset`). Pure representation — knows nothing about any backend. |
 | `Waffle\Commons\Data\Query\Operator` / `Direction` | `enum` operators (`=`, `<>`, `>`, …, `IN`, `LIKE`) and sort directions (`ASC` / `DESC`). |
-| `Waffle\Commons\Data\Compiler\SQLCompiler` | Compiles a `Query` into a parameterized `CompiledQuery` (`?` placeholders, injection-safe) for a chosen `SQLDialect`. |
-| `Waffle\Commons\Data\Compiler\SQLDialect` | `enum` `MySQL` / `SQLite` / `MSSQL` — identifier quoting + pagination grammar. |
+| `Waffle\Commons\Data\Compiler\SQLCompiler` / `SQLWriteCompiler` | Compile a `Query` (reads) or a mapped entity row (`INSERT`/`UPDATE`/`DELETE`) into parameterized statements (`?` placeholders, injection-safe) for a chosen `SQLDialect`. |
+| `Waffle\Commons\Data\Compiler\SQLDialect` | `enum` `MySQL` / `MariaDB` / `SQLite` / `MSSQL` / `PostgreSQL` / `Oracle` — identifier quoting + pagination grammar. |
 | `Waffle\Commons\Data\Compiler\FirestoreCompiler` | Compiles a `Query` into a `CompiledFirestoreQuery` with path isolation; only equality is pushed server-side, ranges/ordering flag `requiresInMemoryFilter`. |
 | `Waffle\Commons\Data\Compiler\FirestoreScope` | `public(appId, collection)` / `private(appId, userId, collection)` path scoping. |
+| `Waffle\Commons\Data\Compiler\{Mongo,KeyValue,Cassandra,GraphQL}Compiler` | Per-backend SQR compilers: MongoDB filter documents, key-value `GET`/`MGET` plans, parameterised CQL, GraphQL query/mutation documents. |
+| `Waffle\Commons\Data\Repository\…` | Seven stateless `WritableRepositoryInterface` repositories — `SQLRepository`, `FirestoreRepository` (three auth guardrails), `MongoRepository`, `CassandraRepository`, `KeyValueRepository`, `GraphQLRepository`, `JsonFileRepository` — full CRUD through pure `DataMapperInterface` mappers. |
+| `Waffle\Commons\Data\Driver\…` | Live drivers: `FirestoreRestClient`, `MongoDriverSession`, `RedisKeyValueClient`, `GraphQLExecutor` (+ the injectable CQL port). Every backend failure is rethrown as a sanitized `DatabaseException`. |
+| `Waffle\Commons\Data\Evaluation\InMemoryEvaluator` | Stateless fetch-then-filter evaluation (range/set/sort/offset) for backends with restricted server-side querying. |
+| `Waffle\Commons\Data\Storage\JsonFileStore` | Atomic flat-file JSON store (read-modify-write under `LOCK_EX`). |
 | `Waffle\Commons\Data\Hydrator\PropertyHookHydrator` | Maps a raw row onto an immutable DTO via its constructor; corrupt data is rejected by the DTO's PHP 8.5 `set` hooks as a `ValidationExceptionInterface`. |
 | `Waffle\Commons\Data\Migration\MigrationRunner` | `MigrationRunnerInterface` — applies versioned `*.sql` files in order, tracked in `waffle_migrations`; each migration runs in its own transaction. |
+| `Waffle\Commons\Data\Warmup\QueryWarmer` | `DataWarmerInterface` — pre-compiles named SQR trees into an atomic `<?php return […]` artifact primed into OPcache (`bin/waffle data:warmup`, Beta-3). |
 | `Waffle\Commons\Data\Exception\DatabaseException` | `DatabaseExceptionInterface` — wraps any backend failure, lifts the ANSI `SQLSTATE` from a `PDOException`. |
 | `Waffle\Commons\Data\Exception\ValidationException` | `ValidationExceptionInterface` — a field-aware hydration/validation failure (surfaces as RFC 7807 `422`). |
 

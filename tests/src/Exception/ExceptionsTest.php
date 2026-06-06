@@ -69,6 +69,28 @@ final class ExceptionsTest extends AbstractTestCase
         self::assertSame($origin, $wrapped->getPrevious());
     }
 
+    /**
+     * Leak containment (RFC-022 / RFC 7807): every driver call-site wraps its
+     * backend failure with an EXPLICIT sanitized message, so credentials, DSNs
+     * and driver internals never reach a rendered error body. The raw driver
+     * error must survive only as `previous`, for logging.
+     */
+    public function testSanitizedWrappingNeverLeaksDriverDetailIntoTheMessage(): void
+    {
+        $poisoned = new RuntimeException(
+            'SQLSTATE[HY000] [1045] Access denied for user \'waffle\'@\'10.0.0.7\' '
+            . '(using password: YES) — dsn mysql:host=db.internal;dbname=prod secret=hunter2',
+        );
+
+        $wrapped = DatabaseException::fromThrowable($poisoned, 'Failed to open the connection.');
+
+        self::assertSame('Failed to open the connection.', $wrapped->getMessage());
+        self::assertStringNotContainsString('hunter2', $wrapped->getMessage());
+        self::assertStringNotContainsString('db.internal', $wrapped->getMessage());
+        self::assertStringNotContainsString('password', $wrapped->getMessage());
+        self::assertSame($poisoned, $wrapped->getPrevious(), 'The raw driver error must survive for logging.');
+    }
+
     public function testValidationExceptionExposesField(): void
     {
         $exception = new ValidationException('bad', 'email');

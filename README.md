@@ -1,91 +1,136 @@
-# Waffle Commons - Component Template
-<img src="./images/waffle-commons_logo.png" alt="Logo Waffles Commons" style="width: 25%;" /><br />
-This repository serves as a standardized template for creating new components within the Waffle Commons ecosystem. It provides a consistent structure, tooling configuration (Composer, PHPUnit, Mago, Psalm), and CI/CD pipeline (GitHub Actions) to accelerate development and maintain quality across all packages.
+[![Discord](https://img.shields.io/discord/755288001592033391?logo=discord)](https://discord.gg/eKgywnfXr2)
+[![PHP Version Require](http://poser.pugx.org/waffle-commons/data/require/php)](https://packagist.org/packages/waffle-commons/data)
+[![PHP CI](https://github.com/waffle-commons/data/actions/workflows/main.yml/badge.svg)](https://github.com/waffle-commons/data/actions/workflows/main.yml)
+[![codecov](https://codecov.io/gh/waffle-commons/data/graph/badge.svg)](https://codecov.io/gh/waffle-commons/data)
+[![Latest Stable Version](http://poser.pugx.org/waffle-commons/data/v)](https://packagist.org/packages/waffle-commons/data)
+[![Latest Unstable Version](http://poser.pugx.org/waffle-commons/data/v/unstable)](https://packagist.org/packages/waffle-commons/data)
+[![Total Downloads](https://img.shields.io/packagist/dt/waffle-commons/data.svg)](https://packagist.org/packages/waffle-commons/data)
+[![Packagist License](https://img.shields.io/packagist/l/waffle-commons/data)](https://github.com/waffle-commons/data/blob/main/LICENSE.md)
 
-**Note:** Replace `YOUR_CODECOV_TOKEN_HERE` in the Codecov badge URL if you integrate Codecov. Also, replace `{COMPONENT_NAME}` placeholders in badges after running the configuration script or manually.
+Waffle Data Component
+=====================
 
-## Purpose
-Using this template ensures that new components adhere to the established standards of the Waffle Commons project regarding:
-- **Directory Structure:** Standard `src/`, `tests/`, etc.
-- **Coding Standards:** Enforced via Mago (formatter, linter, analyzer) with pre-configured rules.
-- **Testing:** Setup for PHPUnit, including configuration (`phpunit.xml`), bootstrap, and coverage reporting.
-- **Static Analysis:** Configured for Psalm and Mago Analyze. 
-- **Automation:** Pre-configured GitHub Actions workflow for CI, mirroring the core framework's quality checks. 
-- **Documentation:** Standard files like this `CONTRIBUTING.md`, `LICENSE.md`, issue templates, etc. 
-- **Composer Setup:** Pre-filled `composer.json` with necessary scripts and development dependencies.
+> **Release:** `0.1.0-beta3` &nbsp;|&nbsp; [`CHANGELOG.md`](./CHANGELOG.md)
 
-## How to Use This Template
-Follow these steps precisely to create a new Waffle Commons component:
+The data & persistence layer for the Waffle Framework (RFC-022). Built for FrankenPHP resident-worker mode: a warm connection pool, a backend-agnostic query AST, parameterized SQL / Firestore compilers, a property-hook hydrator, and a stateless SQL migration runner. **No stateful ORM, no identity map, no change tracking** — a row becomes an immutable value object and nothing more.
 
-### 1. **Clone the Template:**
-Use this template to create a new `waffle-commons` repository.
+## 📦 Installation
 
-### 2. **Run the Configuration Script:**
-Execute the provided configuration script, passing the PascalCase component name as the first and only argument. This script will automatically replace the placeholder {COMPONENT_NAME} in file contents, filenames, and directory names.
-```shell
-# Example for 'Http' component
-./configure-component.sh Http
+```bash
+composer require waffle-commons/data
 ```
-- Carefully review the output of the script to ensure all replacements and renames were successful.
 
-### 3. **Review and Finalize `composer.json`:**
-- Open composer.json.
-- Verify the `"name"` is correct (e.g., `waffle-commons/http`). It should have been updated by the script.
-- Crucially, update the `"description"` field to accurately describe your new component's purpose. 
-- Add any specific `require` dependencies needed for this component (e.g., `psr/http-message` for the `http` component).
-- Add specific `require-dev` dependencies if needed beyond the standard template (e.g., `php-mock/php-mock-phpunit` was included, but others might be needed).
-- Verify the PSR-4 namespaces in `autoload` and `autoload-dev` were correctly updated by the script.
+Requires PHP 8.5+ and `ext-pdo`. Depends only on `waffle-commons/contracts` (plus PSR + PHP core).
 
-### 4. **Updates in various files:**
-- Edit this `README.md` file to describe the component.
-- Edit `.github/workflows/main.yml` to activate it.
+## 🧱 Surface
 
-### 5. **Configure GitHub Repository Settings:**
-- **Branch Protection:** Set up branch protection rules for `main` (require status checks to pass, require PR reviews, etc.).
-- **Secrets:** Add necessary secrets (e.g., `CODECOV_TOKEN`) if applicable for CI workflows.
-- **Labels:** Ensure standard labels (`bug`, `enhancement`, `good first issue`, etc.) are created (consider copying from `waffle-commons/waffle`).
-- **Discussions:** Enable GitHub Discussions if desired for the component.
-- **Issue:** Create customized template for **Bug report** (`.github/ISSUE_TEMPLATE/bug-report.md`) and  **Feature request** (`.github/ISSUE_TEMPLATE/feature-request.md`)
-- **Pull request:** Ensure standard pull requests respect the template (`.github/PULL_REQUEST_TEMPLATE.md`)
+| Class | Role |
+| :--- | :--- |
+| `Waffle\Commons\Data\Connection\PDOConnectionPool` | `final` pool of reusable PDO connections (`ConnectionPoolInterface` + `ResettableInterface`). Ping-before-dispense (`SELECT 1`), transparent reconnect, per-connection statement cache, `reset()` rolls back dangling transactions between requests. |
+| `Waffle\Commons\Data\Query\Criteria` | Static factory for predicates: `eq`/`neq`/`gt`/`gte`/`lt`/`lte`/`like`/`in`/`notIn`. |
+| `Waffle\Commons\Data\Query\Query` | Immutable, copy-on-write query AST (`select` / `from` / `where` / `orderBy` / `limit` / `offset`). Pure representation — knows nothing about any backend. |
+| `Waffle\Commons\Data\Query\Operator` / `Direction` | `enum` operators (`=`, `<>`, `>`, …, `IN`, `LIKE`) and sort directions (`ASC` / `DESC`). |
+| `Waffle\Commons\Data\Compiler\SQLCompiler` / `SQLWriteCompiler` | Compile a `Query` (reads) or a mapped entity row (`INSERT`/`UPDATE`/`DELETE`) into parameterized statements (`?` placeholders, injection-safe) for a chosen `SQLDialect`. |
+| `Waffle\Commons\Data\Compiler\SQLDialect` | `enum` `MySQL` / `MariaDB` / `SQLite` / `MSSQL` / `PostgreSQL` / `Oracle` — identifier quoting + pagination grammar. |
+| `Waffle\Commons\Data\Compiler\FirestoreCompiler` | Compiles a `Query` into a `CompiledFirestoreQuery` with path isolation; only equality is pushed server-side, ranges/ordering flag `requiresInMemoryFilter`. |
+| `Waffle\Commons\Data\Compiler\FirestoreScope` | `public(appId, collection)` / `private(appId, userId, collection)` path scoping. |
+| `Waffle\Commons\Data\Compiler\{Mongo,KeyValue,Cassandra,GraphQL}Compiler` | Per-backend SQR compilers: MongoDB filter documents, key-value `GET`/`MGET` plans, parameterised CQL, GraphQL query/mutation documents. |
+| `Waffle\Commons\Data\Repository\…` | Seven stateless `WritableRepositoryInterface` repositories — `SQLRepository`, `FirestoreRepository` (three auth guardrails), `MongoRepository`, `CassandraRepository`, `KeyValueRepository`, `GraphQLRepository`, `JsonFileRepository` — full CRUD through pure `DataMapperInterface` mappers. |
+| `Waffle\Commons\Data\Driver\…` | Live drivers: `FirestoreRestClient`, `MongoDriverSession`, `RedisKeyValueClient`, `GraphQLExecutor` (+ the injectable CQL port). Every backend failure is rethrown as a sanitized `DatabaseException`. |
+| `Waffle\Commons\Data\Evaluation\InMemoryEvaluator` | Stateless fetch-then-filter evaluation (range/set/sort/offset) for backends with restricted server-side querying. |
+| `Waffle\Commons\Data\Storage\JsonFileStore` | Atomic flat-file JSON store (read-modify-write under `LOCK_EX`). |
+| `Waffle\Commons\Data\Hydrator\PropertyHookHydrator` | Maps a raw row onto an immutable DTO via its constructor; corrupt data is rejected by the DTO's PHP 8.5 `set` hooks as a `ValidationExceptionInterface`. |
+| `Waffle\Commons\Data\Migration\MigrationRunner` | `MigrationRunnerInterface` — applies versioned `*.sql` files in order, tracked in `waffle_migrations`; each migration runs in its own transaction. |
+| `Waffle\Commons\Data\Warmup\QueryWarmer` | `DataWarmerInterface` — pre-compiles named SQR trees into an atomic `<?php return […]` artifact primed into OPcache (`bin/waffle data:warmup`, Beta-3). |
+| `Waffle\Commons\Data\Exception\DatabaseException` | `DatabaseExceptionInterface` — wraps any backend failure, lifts the ANSI `SQLSTATE` from a `PDOException`. |
+| `Waffle\Commons\Data\Exception\ValidationException` | `ValidationExceptionInterface` — a field-aware hydration/validation failure (surfaces as RFC 7807 `422`). |
 
-### 6. **Start Developing!**
-You can now start writing your component's code in the `src/` directory and corresponding tests in the `tests/` directory. Remember to follow the established coding standards.
+## 🚀 Quick start
 
-## Development Tooling (Composer Scripts)
-This template comes with pre-configured Composer scripts for common development tasks. Run these from the root of your new component's directory:
-- **Install Dependencies:**
-    ```shell
-    composer install
-    ```
-- **Run Tests (PHPUnit):** Generates coverage reports in `var/data/phpunit-coverage/`.
-    ```shell
-    composer tests
-    ```
-- **Run Mago (Format Check, Lint, Analyze):**
-    ```shell
-    composer mago
-    ```
-    - Check Formatting Only: `composer formatter --check`
-    - Apply Formatting: `composer formatter` 
-    - Run Linter: `composer linter`
-    - Run Analyzer: `composer analyzer`
-- **Run Psalm-Taint Analysis:**
-    ```shell
-    vendor/bin/psalm --taint-analysis
-    ```
-- **Check for Dependency Vulnerabilities:**
-    ```shell
-    composer audit
-    ```
-- **Run All CI Checks Locally:** Simulates the checks run in GitHub Actions (without security checks).
-    ```shell
-    composer ci
-    ```
+### Connection pool
 
-## Contributing
-While this repository is a template, contributions to the template itself (improving tooling, structure, CI) are welcome via Pull Requests to the `waffle-commons/component-template` repository.
+```php
+use Waffle\Commons\Data\Connection\PDOConnectionPool;
 
-For contributions to components created from this template, please refer to the main and the specific `CONTRIBUTING.md` within that component's repository.
+$pool = new PDOConnectionPool(
+    factory: static fn (): \PDO => new \PDO($dsn, $user, $pass, [
+        \PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION,
+    ]),
+    maxConnections: 8,        // hard ceiling on simultaneously borrowed handles
+    pingQuery: 'SELECT 1',    // liveness probe before dispensing
+);
 
-## License
-This template, and components created from it by default, are licensed under the MIT License. See the file for details.
+$connection = $pool->acquire();   // a healthy PDO, reconnected transparently if the socket died
+// ... use $connection ...
+$pool->release($connection);      // return it to the idle set
+$pool->reset();                   // end-of-request: roll back stragglers, clear statement cache
+```
+
+### Build a query, compile it for a backend
+
+```php
+use Waffle\Commons\Data\Query\Query;
+use Waffle\Commons\Data\Query\Criteria;
+use Waffle\Commons\Data\Query\Direction;
+use Waffle\Commons\Data\Compiler\SQLCompiler;
+use Waffle\Commons\Data\Compiler\SQLDialect;
+
+$query = Query::select('id', 'email')
+    ->from('users')
+    ->where(Criteria::eq('status', 'active'), Criteria::in('role', ['admin', 'editor']))
+    ->orderBy('email', Direction::Ascending)
+    ->limit(20);
+
+$compiled = new SQLCompiler(SQLDialect::MySQL)->compile($query);
+$compiled->sql;        // 'SELECT `id`, `email` FROM `users` WHERE `status` = ? AND `role` IN (?, ?) ORDER BY `email` ASC LIMIT 20'
+$compiled->parameters; // ['active', 'admin', 'editor']
+```
+
+The same `Query` compiles to a Firestore payload via `FirestoreCompiler` with a `FirestoreScope` (public vs per-user path isolation).
+
+### Hydrate an immutable DTO
+
+```php
+use Waffle\Commons\Data\Hydrator\PropertyHookHydrator;
+
+$hydrator = new PropertyHookHydrator(UserDto::class);
+$user = $hydrator->hydrate(['id' => '42', 'email' => 'ada@example.com']); // UserDto
+// A malformed value is rejected by UserDto's `set` hook as a ValidationExceptionInterface.
+```
+
+### Run migrations (from the CLI)
+
+`MigrationRunner` is wired into the console as `bin/waffle db:migrate` (see the [`console`](https://github.com/waffle-commons/console) component). Programmatically:
+
+```php
+use Waffle\Commons\Data\Migration\MigrationRunner;
+
+$runner = new MigrationRunner(pool: $pool, config: $config);
+$applied = $runner->run(static fn (string $version) => printf("applied %s\n", $version));
+// $applied: list of versions applied this run ([] when already up to date)
+```
+
+## 🐘 PHP 8.5 features used
+
+- `final readonly class` for every value object (`CompiledQuery`, `CompiledFirestoreQuery`, `Comparison`, `Order`, `FirestoreScope`).
+- **Property Hooks** — DTOs validate inside their own `set` hooks; the hydrator never sees invalid state. (A hooked DTO is `final class` + `public private(set)`, since hooked properties cannot be `readonly`.)
+- **Asymmetric visibility** (`public private(set)`) on the immutable `Query` builder.
+- First-class callable syntax (`$this->method(...)`) in the compilers; `enum` with methods (`Operator::isSetOperator()`); `never`-returning rejection helpers; typed class constants.
+
+## 🧭 Architectural boundary (`mago guard`)
+
+Production code under `Waffle\Commons\Data` may depend **only** on `Waffle\Commons\Data\**`, `Waffle\Commons\Contracts\**`, `Psr\**`, and `@global` + `Psl\**`. A forbidden `use` fails the build, not a reviewer — enforced by `vendor/bin/mago guard` (bundled into `composer mago`, zero baselines). Interfaces must be named `*Interface`, `Exception\**` classes must end in `*Exception`, and any `Enum\**` namespace may hold only `enum` declarations.
+
+Contract-first, component-agnostic by construction: the data layer composes with the rest of the framework through `waffle-commons/contracts`, never directly through another component.
+
+## 🧪 Testing
+
+```bash
+docker exec -w /waffle-commons/data waffle-dev composer tests
+```
+
+The full gate (`composer mago && composer tests`) runs format, lint, analyze, guard, and PHPUnit (≥95% line coverage) with zero baselines.
+
+## 📄 License
+
+MIT — see [LICENSE.md](./LICENSE.md).

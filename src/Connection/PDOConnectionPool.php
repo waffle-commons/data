@@ -8,7 +8,9 @@ use Closure;
 use PDO;
 use PDOException;
 use PDOStatement;
+use Waffle\Commons\Contracts\Data\Connection\ConnectionKind;
 use Waffle\Commons\Contracts\Data\Connection\ConnectionPoolInterface;
+use Waffle\Commons\Contracts\Data\Connection\ConnectionTrackerInterface;
 use Waffle\Commons\Contracts\Service\ResettableInterface;
 use Waffle\Commons\Data\Exception\DatabaseException;
 
@@ -66,6 +68,11 @@ final class PDOConnectionPool implements ConnectionPoolInterface, ResettableInte
      *                                        connections; protects the worker from
      *                                        unbounded socket growth.
      * @param non-empty-string $pingQuery     Liveness probe executed before dispensing.
+     * @param ?ConnectionTrackerInterface $tracker DIAG-03 orphaned-connection tracer.
+     *                                        Null (the default) disables tracing entirely —
+     *                                        zero overhead in production; a dev wiring injects
+     *                                        a tracker so a borrowed-but-never-released handle
+     *                                        is surfaced at request end.
      *
      * @throws DatabaseException When $maxConnections is below 1.
      */
@@ -73,6 +80,7 @@ final class PDOConnectionPool implements ConnectionPoolInterface, ResettableInte
         private readonly Closure $factory,
         private readonly int $maxConnections = 8,
         private readonly string $pingQuery = 'SELECT 1',
+        private readonly ?ConnectionTrackerInterface $tracker = null,
     ) {
         if ($maxConnections < 1) {
             throw new DatabaseException('A connection pool must allow at least one connection.');
@@ -89,6 +97,7 @@ final class PDOConnectionPool implements ConnectionPoolInterface, ResettableInte
             unset($this->idle[$id]);
             if ($this->isAlive($connection)) {
                 $this->inUse[$id] = $connection;
+                $this->tracker?->trackOpen($this->traceId($id), ConnectionKind::Pdo);
 
                 return $connection;
             }
@@ -109,6 +118,7 @@ final class PDOConnectionPool implements ConnectionPoolInterface, ResettableInte
         // Re-key on the object id so releasing the same handle twice is a no-op
         // rather than a duplicate idle entry.
         $this->idle[$id] = $connection;
+        $this->tracker?->trackClose($this->traceId($id));
     }
 
     /**
@@ -193,9 +203,20 @@ final class PDOConnectionPool implements ConnectionPoolInterface, ResettableInte
         }
 
         $connection = $this->create();
-        $this->inUse[spl_object_id($connection)] = $connection;
+        $id = spl_object_id($connection);
+        $this->inUse[$id] = $connection;
+        $this->tracker?->trackOpen($this->traceId($id), ConnectionKind::Pdo);
 
         return $connection;
+    }
+
+    /**
+     * Stable, kind-scoped trace id for a connection so the DIAG-03 ledger never
+     * confuses a recycled `spl_object_id()` with a handle of another kind.
+     */
+    private function traceId(int $connectionId): string
+    {
+        return 'pdo:' . $connectionId;
     }
 
     /**

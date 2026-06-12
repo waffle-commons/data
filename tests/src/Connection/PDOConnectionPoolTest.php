@@ -8,6 +8,8 @@ use Closure;
 use PDO;
 use PDOException;
 use PHPUnit\Framework\Attributes\CoversClass;
+use Waffle\Commons\Contracts\Data\Connection\ConnectionKind;
+use Waffle\Commons\Contracts\Data\Connection\ConnectionTrackerInterface;
 use Waffle\Commons\Data\Connection\PDOConnectionPool;
 use Waffle\Commons\Data\Exception\DatabaseException;
 use WaffleTests\Commons\Data\AbstractTestCase;
@@ -214,5 +216,88 @@ final class PDOConnectionPoolTest extends AbstractTestCase
         self::assertNotFalse($count);
         self::assertSame(50, (int) $count->fetchColumn());
         self::assertSame(1, $pool->idleCount() + $pool->activeCount());
+    }
+
+    public function testAcquireTracksAnOpenConnection(): void
+    {
+        $tracker = $this->recordingTracker();
+        $pool = new PDOConnectionPool($this->sqliteFactory(), tracker: $tracker);
+
+        $pool->acquire();
+
+        $open = $tracker->openConnections();
+        self::assertCount(1, $open);
+        self::assertSame(ConnectionKind::Pdo, $open[0]['kind'] ?? null);
+    }
+
+    public function testReleaseTracksTheConnectionClosed(): void
+    {
+        $tracker = $this->recordingTracker();
+        $pool = new PDOConnectionPool($this->sqliteFactory(), tracker: $tracker);
+
+        $pool->release($pool->acquire());
+
+        self::assertSame([], $tracker->openConnections());
+    }
+
+    public function testLeakedConnectionStaysOpenInTheTracker(): void
+    {
+        $tracker = $this->recordingTracker();
+        $pool = new PDOConnectionPool($this->sqliteFactory(), tracker: $tracker);
+
+        // Borrowed but never released ⇒ still open at request end (a DIAG-03 leak).
+        $pool->acquire();
+
+        self::assertCount(1, $tracker->openConnections());
+    }
+
+    public function testReusedIdleConnectionIsTrackedOnReacquire(): void
+    {
+        $tracker = $this->recordingTracker();
+        $pool = new PDOConnectionPool($this->sqliteFactory(), tracker: $tracker);
+
+        $pool->release($pool->acquire());
+        self::assertSame([], $tracker->openConnections());
+
+        // Re-acquiring the warm idle handle must re-open it in the ledger.
+        $pool->acquire();
+        self::assertCount(1, $tracker->openConnections());
+    }
+
+    private function recordingTracker(): ConnectionTrackerInterface
+    {
+        return new class implements ConnectionTrackerInterface {
+            /** @var array<string, ConnectionKind> */
+            private array $open = [];
+
+            #[\Override]
+            public function trackOpen(string $id, ConnectionKind $kind): void
+            {
+                $this->open[$id] = $kind;
+            }
+
+            #[\Override]
+            public function trackClose(string $id): void
+            {
+                unset($this->open[$id]);
+            }
+
+            #[\Override]
+            public function openConnections(): array
+            {
+                $connections = [];
+                foreach ($this->open as $id => $kind) {
+                    $connections[] = ['id' => $id, 'kind' => $kind];
+                }
+
+                return $connections;
+            }
+
+            #[\Override]
+            public function reset(): void
+            {
+                $this->open = [];
+            }
+        };
     }
 }

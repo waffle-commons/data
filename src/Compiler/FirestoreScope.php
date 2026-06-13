@@ -6,10 +6,10 @@ namespace Waffle\Commons\Data\Compiler;
 
 use InvalidArgumentException;
 
+use function mb_trim;
 use function preg_match;
 use function rawurlencode;
 use function sprintf;
-use function trim;
 
 /**
  * Builds and validates the *only* two collection paths a Firestore document may
@@ -68,7 +68,7 @@ final readonly class FirestoreScope
      */
     private static function segment(string $value, string $label): string
     {
-        $trimmed = trim($value);
+        $trimmed = mb_trim($value);
         if ($trimmed === '') {
             throw new InvalidArgumentException(sprintf('Firestore path segment "%s" must not be blank.', $label));
         }

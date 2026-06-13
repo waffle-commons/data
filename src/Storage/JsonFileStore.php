@@ -16,9 +16,9 @@ use function file_put_contents;
 use function is_dir;
 use function is_file;
 use function json_encode;
+use function mb_trim;
 use function rename;
 use function sprintf;
-use function trim;
 use function uniqid;
 use function unlink;
 
@@ -73,7 +73,7 @@ final class JsonFileStore
             throw new DatabaseException(sprintf('Failed to read the JSON store "%s".', $path));
         }
 
-        if (trim($contents) === '') {
+        if (mb_trim($contents) === '') {
             return [];
         }
 

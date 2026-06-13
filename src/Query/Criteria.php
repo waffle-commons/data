@@ -82,7 +82,7 @@ final class Criteria
     /** @throws InvalidArgumentException When the field name is blank. */
     private static function field(string $field): string
     {
-        if (trim($field) === '') {
+        if (mb_trim($field) === '') {
             throw new InvalidArgumentException('A criteria field name must not be blank.');
         }
 

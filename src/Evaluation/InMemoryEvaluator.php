@@ -109,6 +109,9 @@ final class InMemoryEvaluator
         }
 
         $literal = preg_quote($pattern, '/');
+        // HARDEN-03: collapse runs of the multi-char wildcard so a pattern like
+        // "%%%%…" cannot expand to ".*.*.*…" and trigger catastrophic backtracking.
+        $literal = preg_replace('/%+/', '%', $literal) ?? $literal;
 
         return preg_match('/^' . str_replace(['%', '_'], ['.*', '.'], $literal) . '$/', $value) === 1;
     }

@@ -176,6 +176,15 @@ final class SQLCompilerTest extends AbstractTestCase
         self::assertSame('SELECT `a``b` FROM `t`', $compiled->sql);
     }
 
+    public function testIdentifierWithControlCharacterIsRejected(): void
+    {
+        // HARDEN-03: a NUL/control byte cannot be neutralised by quoting, so the
+        // dialect rejects it outright (allow-list alongside escaping).
+        $this->expectException(InvalidArgumentException::class);
+
+        SQLDialect::MySQL->quoteIdentifier("col\x00umn");
+    }
+
     /**
      * The pagination provider asserts dialect-specific tails; the table/column
      * quoting differs per dialect, so re-quote non-MySQL identifiers back to the

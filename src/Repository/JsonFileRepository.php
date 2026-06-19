@@ -6,12 +6,16 @@ namespace Waffle\Commons\Data\Repository;
 
 use Generator;
 use InvalidArgumentException;
+use Throwable;
 use Waffle\Commons\Contracts\Data\Mapper\DataMapperInterface;
 use Waffle\Commons\Contracts\Data\Query\QueryInterface;
 use Waffle\Commons\Contracts\Data\Repository\WritableRepositoryInterface;
+use Waffle\Commons\Contracts\Telemetry\NullTracer;
+use Waffle\Commons\Contracts\Telemetry\TracerInterface;
 use Waffle\Commons\Data\Hydrator\PropertyHookHydrator;
 use Waffle\Commons\Data\Query\Query;
 use Waffle\Commons\Data\Storage\JsonFileStore;
+use Waffle\Commons\Data\Telemetry\QueryTracer;
 
 use function array_values;
 
@@ -34,6 +38,8 @@ final class JsonFileRepository implements WritableRepositoryInterface
     /** @var PropertyHookHydrator<T> */
     private readonly PropertyHookHydrator $hydrator;
 
+    private QueryTracer $queryTracer;
+
     /**
      * @param string                      $path   Collection file the repository is bound to.
      * @param class-string<T>             $target `readonly` DTO each row hydrates into.
@@ -48,6 +54,42 @@ final class JsonFileRepository implements WritableRepositoryInterface
         private readonly ?DataMapperInterface $mapper = null,
     ) {
         $this->hydrator = new PropertyHookHydrator($target);
+        $this->queryTracer = new QueryTracer(new NullTracer(), 'jsonfile');
+    }
+
+    /**
+     * Return a copy that emits `waffle.db.query` spans through the given tracer
+     * (OBS-01). Tracing is opt-in at wiring time; the no-op default keeps the
+     * hot path free and the returned instance stays immutable across worker
+     * requests.
+     *
+     * @return self<T>
+     */
+    public function withTracer(TracerInterface $tracer): self
+    {
+        $clone = clone $this;
+        $clone->queryTracer = new QueryTracer($tracer, 'jsonfile');
+
+        return $clone;
+    }
+
+    /**
+     * @return list<T>
+     *
+     * @throws Throwable When the store read fails or a row cannot be hydrated.
+     */
+    #[\Override]
+    public function find(QueryInterface $query): array
+    {
+        $span = $this->queryTracer->open('find');
+
+        try {
+            return $this->runFind($query);
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
@@ -56,8 +98,7 @@ final class JsonFileRepository implements WritableRepositoryInterface
      * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
      * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
      */
-    #[\Override]
-    public function find(QueryInterface $query): array
+    private function runFind(QueryInterface $query): array
     {
         $hydrated = [];
         foreach ($this->store->query($this->path, $query) as $row) {
@@ -70,10 +111,7 @@ final class JsonFileRepository implements WritableRepositoryInterface
     /**
      * @return T|null
      *
-     * @throws InvalidArgumentException When the rebuilt bounded query is invalid
-     *         (never for the fixed bound used here; kept for contract honesty).
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
-     * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
+     * @throws Throwable When the store read fails or the row cannot be hydrated.
      */
     #[\Override]
     public function findOne(QueryInterface $query): ?object
@@ -82,7 +120,34 @@ final class JsonFileRepository implements WritableRepositoryInterface
         // then stops materialising past the first row.
         $bounded = $query instanceof Query ? $query->limit(1) : $query;
 
-        return $this->find($bounded)[0] ?? null;
+        $span = $this->queryTracer->open('findOne');
+
+        try {
+            return $this->runFind($bounded)[0] ?? null;
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
+    }
+
+    /**
+     * @return Generator<int, T>
+     *
+     * @throws Throwable When the store read fails or a row cannot be hydrated.
+     */
+    #[\Override]
+    public function stream(QueryInterface $query): Generator
+    {
+        $span = $this->queryTracer->open('stream');
+
+        try {
+            yield from $this->runStream($query);
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
@@ -91,8 +156,7 @@ final class JsonFileRepository implements WritableRepositoryInterface
      * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
      * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
      */
-    #[\Override]
-    public function stream(QueryInterface $query): Generator
+    private function runStream(QueryInterface $query): Generator
     {
         foreach ($this->store->query($this->path, $query) as $row) {
             yield $this->hydrator->hydrate($row);
@@ -103,92 +167,113 @@ final class JsonFileRepository implements WritableRepositoryInterface
      * Read-modify-write the whole collection file atomically: INSERT (null id)
      * appends, otherwise the row with a matching identity is replaced (upsert).
      *
-     * @throws InvalidArgumentException When the repository has no mapper.
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
+     * @throws Throwable When the repository has no mapper or the store write fails.
      */
     #[\Override]
     public function save(object $entity): void
     {
-        $mapper = $this->requireMapper();
-        $id = $mapper->identify($entity);
-        $row = $mapper->toRow($entity);
+        $span = $this->queryTracer->open('save');
 
-        $rows = $this->store->read($this->path);
+        try {
+            $mapper = $this->requireMapper();
+            $id = $mapper->identify($entity);
+            $row = $mapper->toRow($entity);
 
-        if ($id === null) {
-            $rows[] = $row;
-            $this->store->write($this->path, array_values($rows));
+            $rows = $this->store->read($this->path);
 
-            return;
-        }
+            if ($id === null) {
+                $rows[] = $row;
+                $this->store->write($this->path, array_values($rows));
 
-        $idField = $mapper->identityField();
-        $replaced = false;
-        foreach ($rows as $index => $existing) {
-            if (($existing[$idField] ?? null) !== $id) {
-                continue;
+                return;
             }
 
-            $rows[$index] = $row;
-            $replaced = true;
+            $idField = $mapper->identityField();
+            $replaced = false;
+            foreach ($rows as $index => $existing) {
+                if (($existing[$idField] ?? null) !== $id) {
+                    continue;
+                }
 
-            break;
+                $rows[$index] = $row;
+                $replaced = true;
+
+                break;
+            }
+
+            if (!$replaced) {
+                $rows[] = $row;
+            }
+
+            $this->store->write($this->path, array_values($rows));
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
         }
-
-        if (!$replaced) {
-            $rows[] = $row;
-        }
-
-        $this->store->write($this->path, array_values($rows));
     }
 
     /**
-     * @throws InvalidArgumentException When the repository has no mapper, or the
-     *         entity carries no identity.
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
+     * @throws Throwable When the repository has no mapper, the entity carries no
+     *         identity, or the store write fails.
      */
     #[\Override]
     public function delete(object $entity): void
     {
-        $mapper = $this->requireMapper();
-        $id = $mapper->identify($entity);
-        if ($id === null) {
-            throw new InvalidArgumentException('Cannot delete an entity that carries no identity.');
-        }
+        $span = $this->queryTracer->open('delete');
 
-        $idField = $mapper->identityField();
-        $remaining = [];
-        foreach ($this->store->read($this->path) as $existing) {
-            if (($existing[$idField] ?? null) === $id) {
-                continue;
+        try {
+            $mapper = $this->requireMapper();
+            $id = $mapper->identify($entity);
+            if ($id === null) {
+                throw new InvalidArgumentException('Cannot delete an entity that carries no identity.');
             }
 
-            $remaining[] = $existing;
-        }
+            $idField = $mapper->identityField();
+            $remaining = [];
+            foreach ($this->store->read($this->path) as $existing) {
+                if (($existing[$idField] ?? null) === $id) {
+                    continue;
+                }
 
-        $this->store->write($this->path, $remaining);
+                $remaining[] = $existing;
+            }
+
+            $this->store->write($this->path, $remaining);
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
      * @return T|null
      *
-     * @throws InvalidArgumentException When the repository has no mapper.
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
-     * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
+     * @throws Throwable When the repository has no mapper, the store read fails,
+     *         or the row cannot be hydrated.
      */
     #[\Override]
     public function findById(int|string $id): ?object
     {
-        $mapper = $this->requireMapper();
-        $idField = $mapper->identityField();
+        $span = $this->queryTracer->open('findById');
 
-        foreach ($this->store->read($this->path) as $row) {
-            if (($row[$idField] ?? null) === $id) {
-                return $this->hydrator->hydrate($row);
+        try {
+            $mapper = $this->requireMapper();
+            $idField = $mapper->identityField();
+
+            foreach ($this->store->read($this->path) as $row) {
+                if (($row[$idField] ?? null) === $id) {
+                    return $this->hydrator->hydrate($row);
+                }
             }
-        }
 
-        return null;
+            return null;
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**

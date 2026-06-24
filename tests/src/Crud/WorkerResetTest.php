@@ -31,7 +31,7 @@ final class WorkerResetTest extends AbstractTestCase
     {
         $pool = new PDOConnectionPool(factory: static fn(): PDO => new PDO('sqlite::memory:'));
         $connection = $pool->acquire();
-        $connection->exec('CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score REAL)');
+        $connection->pdo()->exec('CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score REAL)');
         $pool->release($connection);
 
         $repository = new SQLRepository(
@@ -50,7 +50,7 @@ final class WorkerResetTest extends AbstractTestCase
             $repository->findById(0);
 
             $scratch = $pool->acquire();
-            $scratch->exec('DELETE FROM people');
+            $scratch->pdo()->exec('DELETE FROM people');
             $pool->release($scratch);
 
             // The kernel calls this between every request loop.

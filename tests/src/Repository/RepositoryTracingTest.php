@@ -74,8 +74,8 @@ final class RepositoryTracingTest extends AbstractTestCase
 
         $this->pool = new PDOConnectionPool(factory: static fn(): PDO => new PDO('sqlite::memory:'));
         $connection = $this->pool->acquire();
-        $connection->exec('CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score REAL)');
-        $connection->exec("INSERT INTO people (id, name, score) VALUES (1, 'alice', 9.5)");
+        $connection->pdo()->exec('CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score REAL)');
+        $connection->pdo()->exec("INSERT INTO people (id, name, score) VALUES (1, 'alice', 9.5)");
         $this->pool->release($connection);
 
         $this->directory = sys_get_temp_dir() . '/waffle-trace-repo-' . bin2hex(random_bytes(6));

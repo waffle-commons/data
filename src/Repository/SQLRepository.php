@@ -10,7 +10,7 @@ use PDO;
 use PDOException;
 use PDOStatement;
 use Throwable;
-use Waffle\Commons\Contracts\Data\Connection\ConnectionPoolInterface;
+use Waffle\Commons\Contracts\Data\Connection\RelationalConnectionPoolInterface;
 use Waffle\Commons\Contracts\Data\Mapper\DataMapperInterface;
 use Waffle\Commons\Contracts\Data\Query\QueryInterface;
 use Waffle\Commons\Contracts\Data\Repository\WritableRepositoryInterface;
@@ -59,7 +59,7 @@ final class SQLRepository implements WritableRepositoryInterface
     private QueryTracer $queryTracer;
 
     /**
-     * @param ConnectionPoolInterface     $pool          Worker-safe PDO pool.
+     * @param RelationalConnectionPoolInterface $pool          Worker-safe relational pool.
      * @param class-string<T>             $target        `readonly` DTO each row hydrates into.
      * @param SQLCompiler                 $compiler      Dialect-aware read (SELECT) compiler.
      * @param DataMapperInterface<T>|null $mapper        Write/identity mapper; omit for a read-only
@@ -69,7 +69,7 @@ final class SQLRepository implements WritableRepositoryInterface
      *                                                   compiler's dialect (defaults to MySQL).
      */
     public function __construct(
-        private readonly ConnectionPoolInterface $pool,
+        private readonly RelationalConnectionPoolInterface $pool,
         string $target,
         private readonly SQLCompiler $compiler = new SQLCompiler(),
         private readonly ?DataMapperInterface $mapper = null,
@@ -127,7 +127,8 @@ final class SQLRepository implements WritableRepositoryInterface
     private function runFind(QueryInterface $query): array
     {
         $compiled = $this->compiler->compile($query);
-        $connection = $this->pool->acquire();
+        $lease = $this->pool->acquire();
+        $connection = $lease->pdo();
 
         try {
             $statement = $this->execute($connection, $compiled);
@@ -136,7 +137,7 @@ final class SQLRepository implements WritableRepositoryInterface
         } catch (PDOException $error) {
             throw DatabaseException::fromThrowable($error, 'Failed to execute the find query.');
         } finally {
-            $this->pool->release($connection);
+            $this->pool->release($lease);
         }
 
         $hydrated = [];
@@ -249,14 +250,6 @@ final class SQLRepository implements WritableRepositoryInterface
     /**
      * @return Generator<int, T>
      *
-     * @throws InvalidArgumentException When the query cannot be represented on
-     *         this backend (e.g. it has no source table).
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
-     * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
-     */
-    /**
-     * @return Generator<int, T>
-     *
      * @throws Throwable When the backend call fails or a row cannot be hydrated.
      */
     #[\Override]
@@ -284,7 +277,8 @@ final class SQLRepository implements WritableRepositoryInterface
     private function runStream(QueryInterface $query): Generator
     {
         $compiled = $this->compiler->compile($query);
-        $connection = $this->pool->acquire();
+        $lease = $this->pool->acquire();
+        $connection = $lease->pdo();
 
         try {
             $statement = $this->execute($connection, $compiled);
@@ -297,7 +291,7 @@ final class SQLRepository implements WritableRepositoryInterface
         } finally {
             // Runs on completion, on failure, and when the consumer abandons
             // the generator early — the handle always returns to the pool.
-            $this->pool->release($connection);
+            $this->pool->release($lease);
         }
     }
 
@@ -367,10 +361,20 @@ final class SQLRepository implements WritableRepositoryInterface
      */
     private function executeWrite(CompiledWrite $compiled): void
     {
-        $connection = $this->pool->acquire();
+        $lease = $this->pool->acquire();
+        $connection = $lease->pdo();
+
+        // DBAL-01: when an outer transaction is already open (the failsafe
+        // TransactionIsolationMiddleware pinned this connection and began one),
+        // enlist in it — never open or commit a nested one. The outer scope owns
+        // the commit/rollback so this write becomes part of it and is rolled back
+        // with the request on failure.
+        $ownsTransaction = !$connection->inTransaction();
 
         try {
-            $connection->beginTransaction();
+            if ($ownsTransaction) {
+                $connection->beginTransaction();
+            }
 
             $statement = $connection->prepare($compiled->sql);
             if ($statement === false) {
@@ -384,17 +388,24 @@ final class SQLRepository implements WritableRepositoryInterface
             }
 
             $statement->execute();
-            $connection->commit();
+
+            if ($ownsTransaction) {
+                $connection->commit();
+            }
         } catch (PDOException $error) {
-            $this->rollBack($connection);
+            if ($ownsTransaction) {
+                $this->rollBack($connection);
+            }
 
             throw DatabaseException::fromThrowable($error, 'Failed to execute the compiled write.');
         } catch (DatabaseException $error) {
-            $this->rollBack($connection);
+            if ($ownsTransaction) {
+                $this->rollBack($connection);
+            }
 
             throw $error;
         } finally {
-            $this->pool->release($connection);
+            $this->pool->release($lease);
         }
     }
 

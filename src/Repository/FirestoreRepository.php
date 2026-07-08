@@ -6,10 +6,13 @@ namespace Waffle\Commons\Data\Repository;
 
 use Generator;
 use InvalidArgumentException;
+use Throwable;
 use Waffle\Commons\Contracts\Auth\SecurityContextInterface;
 use Waffle\Commons\Contracts\Data\Mapper\DataMapperInterface;
 use Waffle\Commons\Contracts\Data\Query\QueryInterface;
 use Waffle\Commons\Contracts\Data\Repository\WritableRepositoryInterface;
+use Waffle\Commons\Contracts\Telemetry\NullTracer;
+use Waffle\Commons\Contracts\Telemetry\TracerInterface;
 use Waffle\Commons\Data\Compiler\FirestoreCompiler;
 use Waffle\Commons\Data\Compiler\FirestoreScope;
 use Waffle\Commons\Data\Driver\Firestore\FirestoreClientInterface;
@@ -17,6 +20,7 @@ use Waffle\Commons\Data\Evaluation\InMemoryEvaluator;
 use Waffle\Commons\Data\Exception\SecurityPathViolationException;
 use Waffle\Commons\Data\Exception\UnauthenticatedAccessException;
 use Waffle\Commons\Data\Hydrator\PropertyHookHydrator;
+use Waffle\Commons\Data\Telemetry\QueryTracer;
 
 /**
  * Stateless Firestore repository (RFC-022 §3 + §4.2) enforcing the three
@@ -46,6 +50,8 @@ final class FirestoreRepository implements WritableRepositoryInterface
 
     private readonly InMemoryEvaluator $evaluator;
 
+    private QueryTracer $queryTracer;
+
     /**
      * @param FirestoreClientInterface $client   Transport (live: FirestoreRestClient).
      * @param class-string<T>          $target   `readonly` DTO each document hydrates into.
@@ -63,6 +69,23 @@ final class FirestoreRepository implements WritableRepositoryInterface
         $this->hydrator = new PropertyHookHydrator($target);
         $this->compiler = new FirestoreCompiler();
         $this->evaluator = new InMemoryEvaluator();
+        $this->queryTracer = new QueryTracer(new NullTracer(), 'firestore');
+    }
+
+    /**
+     * Return a copy that emits `waffle.db.query` spans through the given tracer
+     * (OBS-01). Tracing is opt-in at wiring time; the no-op default keeps the
+     * hot path free and the returned instance stays immutable across worker
+     * requests.
+     *
+     * @return self<T>
+     */
+    public function withTracer(TracerInterface $tracer): self
+    {
+        $clone = clone $this;
+        $clone->queryTracer = new QueryTracer($tracer, 'firestore');
+
+        return $clone;
     }
 
     /**
@@ -144,11 +167,30 @@ final class FirestoreRepository implements WritableRepositoryInterface
     /**
      * @return list<T>
      *
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
-     * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
+     * @throws Throwable When the caller is anonymous, the backend call fails, or
+     *         a document cannot be hydrated.
      */
     #[\Override]
     public function find(QueryInterface $query): array
+    {
+        $span = $this->queryTracer->open('find');
+
+        try {
+            return $this->runFind($query);
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
+    }
+
+    /**
+     * @return list<T>
+     *
+     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
+     * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
+     */
+    private function runFind(QueryInterface $query): array
     {
         $this->assertAuthenticated();
 
@@ -179,74 +221,114 @@ final class FirestoreRepository implements WritableRepositoryInterface
     /**
      * @return T|null
      *
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
-     * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
+     * @throws Throwable When the caller is anonymous, the backend call fails, or
+     *         the document cannot be hydrated.
      */
     #[\Override]
     public function findOne(QueryInterface $query): ?object
     {
-        return $this->find($query)[0] ?? null;
+        $span = $this->queryTracer->open('findOne');
+
+        try {
+            return $this->runFind($query)[0] ?? null;
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
      * @return Generator<int, T>
      *
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
-     * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
+     * @throws Throwable When the caller is anonymous, the backend call fails, or
+     *         a document cannot be hydrated.
      */
     #[\Override]
     public function stream(QueryInterface $query): Generator
     {
-        yield from $this->find($query);
+        $span = $this->queryTracer->open('stream');
+
+        try {
+            yield from $this->runFind($query);
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
      * @return T|null
      *
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
-     * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
+     * @throws Throwable When the caller is anonymous, the backend call fails, or
+     *         the document cannot be hydrated.
      */
     #[\Override]
     public function findById(int|string $id): ?object
     {
-        $this->assertAuthenticated();
+        $span = $this->queryTracer->open('findById');
 
-        $row = $this->client->getDocument($this->scope->path, (string) $id);
+        try {
+            $this->assertAuthenticated();
 
-        return $row === null ? null : $this->hydrator->hydrate($row);
+            $row = $this->client->getDocument($this->scope->path, (string) $id);
+
+            return $row === null ? null : $this->hydrator->hydrate($row);
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
+     * @throws Throwable When the caller is anonymous or the backend write fails.
      */
     #[\Override]
     public function save(object $entity): void
     {
-        $this->assertAuthenticated();
+        $span = $this->queryTracer->open('save');
 
-        $id = $this->mapper->identify($entity);
-        $this->client->setDocument(
-            $this->scope->path,
-            $id === null ? null : (string) $id,
-            $this->mapper->toRow($entity),
-        );
+        try {
+            $this->assertAuthenticated();
+
+            $id = $this->mapper->identify($entity);
+            $this->client->setDocument(
+                $this->scope->path,
+                $id === null ? null : (string) $id,
+                $this->mapper->toRow($entity),
+            );
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
-     * @throws InvalidArgumentException When the entity carries no identity.
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
+     * @throws Throwable When the caller is anonymous, the entity carries no
+     *         identity, or the backend write fails.
      */
     #[\Override]
     public function delete(object $entity): void
     {
-        $this->assertAuthenticated();
+        $span = $this->queryTracer->open('delete');
 
-        $id = $this->mapper->identify($entity);
-        if ($id === null) {
-            throw new InvalidArgumentException('Cannot delete an entity that carries no identity.');
+        try {
+            $this->assertAuthenticated();
+
+            $id = $this->mapper->identify($entity);
+            if ($id === null) {
+                throw new InvalidArgumentException('Cannot delete an entity that carries no identity.');
+            }
+
+            $this->client->deleteDocument($this->scope->path, (string) $id);
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
         }
-
-        $this->client->deleteDocument($this->scope->path, (string) $id);
     }
 
     /**

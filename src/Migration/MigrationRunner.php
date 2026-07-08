@@ -8,7 +8,7 @@ use Closure;
 use PDO;
 use Throwable;
 use Waffle\Commons\Contracts\Config\ConfigInterface;
-use Waffle\Commons\Contracts\Data\Connection\ConnectionPoolInterface;
+use Waffle\Commons\Contracts\Data\Connection\RelationalConnectionPoolInterface;
 use Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface;
 use Waffle\Commons\Contracts\Data\Migration\MigrationRunnerInterface;
 use Waffle\Commons\Data\Exception\DatabaseException;
@@ -24,7 +24,7 @@ use function sprintf;
 /**
  * Lightweight, forward-only SQL migration runner (RFC-022).
  *
- * The runner borrows a single connection from the {@see ConnectionPoolInterface},
+ * The runner borrows a single connection from the {@see RelationalConnectionPoolInterface},
  * provisions a `waffle_migrations` log table on first use, then applies every
  * `*.sql` script found in the configured directory whose version is not yet
  * recorded — in lexicographic version order. Each script runs inside its own
@@ -47,7 +47,7 @@ final class MigrationRunner implements MigrationRunnerInterface
     private const string DEFAULT_PATH = 'migrations';
 
     public function __construct(
-        private readonly ConnectionPoolInterface $pool,
+        private readonly RelationalConnectionPoolInterface $pool,
         private readonly ConfigInterface $config,
     ) {}
 
@@ -61,7 +61,8 @@ final class MigrationRunner implements MigrationRunnerInterface
     #[\Override]
     public function run(?Closure $onApplied = null): array
     {
-        $connection = $this->pool->acquire();
+        $lease = $this->pool->acquire();
+        $connection = $lease->pdo();
 
         try {
             $this->ensureLogTable($connection);
@@ -85,7 +86,7 @@ final class MigrationRunner implements MigrationRunnerInterface
         } finally {
             // Return the borrowed handle to the pool; the CLI command then calls
             // reset() to clear worker-scoped state before the process exits.
-            $this->pool->release($connection);
+            $this->pool->release($lease);
         }
     }
 

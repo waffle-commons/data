@@ -8,12 +8,16 @@ use Closure;
 use PDO;
 use PDOException;
 use PDOStatement;
+use Waffle\Commons\Contracts\Data\Connection\ConnectionInterface;
 use Waffle\Commons\Contracts\Data\Connection\ConnectionKind;
-use Waffle\Commons\Contracts\Data\Connection\ConnectionPoolInterface;
 use Waffle\Commons\Contracts\Data\Connection\ConnectionTrackerInterface;
+use Waffle\Commons\Contracts\Data\Connection\PdoConnectionInterface;
+use Waffle\Commons\Contracts\Data\Connection\RelationalConnectionPoolInterface;
 use Waffle\Commons\Contracts\Service\ResettableInterface;
 use Waffle\Commons\Data\Exception\DatabaseException;
 
+use function array_fill_keys;
+use function array_keys;
 use function count;
 use function spl_object_id;
 use function sprintf;
@@ -30,14 +34,20 @@ use function sprintf;
  *    is discarded and transparently replaced, so a stale handle never reaches
  *    the caller.
  *  - **Reset between requests** — {@see self::reset()} rolls back any dangling
- *    transaction, returns borrowed handles to the idle set, and clears the
- *    prepared-statement cache, leaving no per-request state to leak into the
- *    next iteration.
+ *    transaction, returns borrowed handles to the idle set, clears the
+ *    prepared-statement cache, and drops any request-scoped affinity, leaving no
+ *    per-request state to leak into the next iteration.
+ *
+ * For the failsafe transaction middleware (DBAL-01) the pool also supports a
+ * request-scoped affinity ({@see self::beginRequestScope()} / {@see self::endRequestScope()}):
+ * while a scope is open every {@see self::acquire()} returns the SAME pinned lease
+ * and {@see self::release()} of it is a no-op, so the middleware's single
+ * transaction contains every downstream repository write.
  *
  * All internal maps are keyed by `spl_object_id()` so a connection is tracked by
  * identity and can never be double-counted or double-pooled.
  */
-final class PDOConnectionPool implements ConnectionPoolInterface, ResettableInterface
+final class PDOConnectionPool implements RelationalConnectionPoolInterface, ResettableInterface
 {
     /**
      * Idle, ready-to-dispense connections.
@@ -59,6 +69,23 @@ final class PDOConnectionPool implements ConnectionPoolInterface, ResettableInte
      * @var array<int, array<string, PDOStatement>>
      */
     private array $statements = [];
+
+    /**
+     * Underlying-handle ids this pool has issued and not yet discarded (DBAL-03):
+     * a set used by {@see self::release()} to reject a lease that did not
+     * originate here, so a foreign handle is never pooled.
+     *
+     * @var array<int, true>
+     */
+    private array $issued = [];
+
+    /**
+     * Request-scoped pinned lease (DBAL-01). While set, {@see self::acquire()}
+     * returns this same lease and {@see self::release()} of it is a no-op, so the
+     * failsafe transaction middleware can open ONE transaction that every
+     * downstream repository write runs inside.
+     */
+    private ?PdoConnection $pinnedLease = null;
 
     /**
      * @param Closure(): PDO $factory        Produces a freshly connected PDO. The pool
@@ -88,15 +115,103 @@ final class PDOConnectionPool implements ConnectionPoolInterface, ResettableInte
     }
 
     /**
+     * Borrow a healthy relational connection lease (ping-before-dispense).
+     *
+     * While a request scope is open ({@see self::beginRequestScope()}) every call
+     * returns the SAME pinned lease, so all repository work in the request shares
+     * one connection.
+     *
      * @throws DatabaseException When no healthy connection can be dispensed.
      */
     #[\Override]
-    public function acquire(): PDO
+    public function acquire(): PdoConnectionInterface
+    {
+        if ($this->pinnedLease !== null) {
+            return $this->pinnedLease;
+        }
+
+        return new PdoConnection($this->acquireRaw(), $this->pingQuery);
+    }
+
+    /**
+     * Open a request-scoped connection affinity and return the pinned lease
+     * (DBAL-01). Idempotent within a scope: a nested call returns the
+     * already-pinned lease.
+     *
+     * @throws DatabaseException When no healthy connection can be dispensed.
+     */
+    #[\Override]
+    public function beginRequestScope(): PdoConnectionInterface
+    {
+        if ($this->pinnedLease !== null) {
+            return $this->pinnedLease;
+        }
+
+        $lease = new PdoConnection($this->acquireRaw(), $this->pingQuery);
+        $this->pinnedLease = $lease;
+
+        return $lease;
+    }
+
+    /**
+     * Close the request-scoped affinity and actually return the pinned
+     * connection to the idle set (DBAL-01). No-op when no scope is open.
+     */
+    #[\Override]
+    public function endRequestScope(): void
+    {
+        $lease = $this->pinnedLease;
+        if ($lease === null) {
+            return;
+        }
+
+        // Unpin first so the now-unprotected release reclaims the handle.
+        $this->pinnedLease = null;
+        $this->release($lease);
+    }
+
+    #[\Override]
+    public function release(ConnectionInterface $connection): void
+    {
+        if (!$connection instanceof PdoConnectionInterface) {
+            // Fail-soft: a lease minted by another pool (or another backend kind)
+            // is not ours to reclaim — silently ignore it.
+            return;
+        }
+
+        // While the scope owns the pinned lease, releasing it is a no-op so a
+        // downstream repository cannot return the middleware's transaction
+        // connection to the idle set mid-request.
+        if ($this->pinnedLease !== null && $connection === $this->pinnedLease) {
+            return;
+        }
+
+        $pdo = $connection->pdo();
+        $id = spl_object_id($pdo);
+        if (($this->issued[$id] ?? false) === false) {
+            // DBAL-03: a lease whose handle this pool never issued is not ours.
+            return;
+        }
+
+        unset($this->inUse[$id]);
+        // Re-key on the object id so releasing the same handle twice is a no-op
+        // rather than a duplicate idle entry.
+        $this->idle[$id] = $pdo;
+        $this->tracker?->trackClose($this->traceId($id));
+    }
+
+    /**
+     * Find or establish a healthy raw PDO handle, registering it as in-use.
+     *
+     * @throws DatabaseException When no healthy connection can be dispensed.
+     */
+    private function acquireRaw(): PDO
     {
         foreach ($this->idle as $id => $connection) {
             unset($this->idle[$id]);
             if ($this->isAlive($connection)) {
                 $this->inUse[$id] = $connection;
+                $this->issued[$id] = true;
                 $this->tracker?->trackOpen($this->traceId($id), ConnectionKind::Pdo);
 
                 return $connection;
@@ -110,17 +225,6 @@ final class PDOConnectionPool implements ConnectionPoolInterface, ResettableInte
         return $this->dispenseFresh();
     }
 
-    #[\Override]
-    public function release(PDO $connection): void
-    {
-        $id = spl_object_id($connection);
-        unset($this->inUse[$id]);
-        // Re-key on the object id so releasing the same handle twice is a no-op
-        // rather than a duplicate idle entry.
-        $this->idle[$id] = $connection;
-        $this->tracker?->trackClose($this->traceId($id));
-    }
-
     /**
      * Borrow-and-cache a prepared statement for the given connection.
      *
@@ -130,16 +234,17 @@ final class PDOConnectionPool implements ConnectionPoolInterface, ResettableInte
      *
      * @throws DatabaseException When the statement cannot be prepared.
      */
-    public function prepare(PDO $connection, string $sql): PDOStatement
+    public function prepare(PdoConnectionInterface $connection, string $sql): PDOStatement
     {
-        $id = spl_object_id($connection);
+        $pdo = $connection->pdo();
+        $id = spl_object_id($pdo);
         $cached = $this->statements[$id][$sql] ?? null;
         if ($cached instanceof PDOStatement) {
             return $cached;
         }
 
         try {
-            $statement = $connection->prepare($sql);
+            $statement = $pdo->prepare($sql);
         } catch (PDOException $error) {
             throw DatabaseException::fromThrowable($error, 'Failed to prepare statement.');
         }
@@ -166,6 +271,10 @@ final class PDOConnectionPool implements ConnectionPoolInterface, ResettableInte
     #[\Override]
     public function reset(): void
     {
+        // Drop any request-scoped affinity: its underlying PDO is already in
+        // $inUse and is rolled back + recycled by the idle path below.
+        $this->pinnedLease = null;
+
         foreach ($this->inUse as $id => $connection) {
             $this->idle[$id] = $connection;
         }
@@ -176,6 +285,10 @@ final class PDOConnectionPool implements ConnectionPoolInterface, ResettableInte
         }
 
         $this->statements = [];
+        // Re-establish the issued-handle set to exactly the warm idle handles:
+        // they survive the request and stay ours to reclaim (DBAL-03), while any
+        // discarded handle's mark is dropped — so the set never grows unbounded.
+        $this->issued = array_fill_keys(array_keys($this->idle), true);
     }
 
     /** Number of warm, idle connections currently held. */
@@ -205,6 +318,7 @@ final class PDOConnectionPool implements ConnectionPoolInterface, ResettableInte
         $connection = $this->create();
         $id = spl_object_id($connection);
         $this->inUse[$id] = $connection;
+        $this->issued[$id] = true;
         $this->tracker?->trackOpen($this->traceId($id), ConnectionKind::Pdo);
 
         return $connection;
@@ -269,6 +383,6 @@ final class PDOConnectionPool implements ConnectionPoolInterface, ResettableInte
 
     private function discard(int $id): void
     {
-        unset($this->inUse[$id], $this->statements[$id]);
+        unset($this->inUse[$id], $this->statements[$id], $this->issued[$id]);
     }
 }

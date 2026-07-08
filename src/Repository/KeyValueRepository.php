@@ -7,9 +7,12 @@ namespace Waffle\Commons\Data\Repository;
 use Generator;
 use InvalidArgumentException;
 use JsonException;
+use Throwable;
 use Waffle\Commons\Contracts\Data\Mapper\DataMapperInterface;
 use Waffle\Commons\Contracts\Data\Query\QueryInterface;
 use Waffle\Commons\Contracts\Data\Repository\WritableRepositoryInterface;
+use Waffle\Commons\Contracts\Telemetry\NullTracer;
+use Waffle\Commons\Contracts\Telemetry\TracerInterface;
 use Waffle\Commons\Data\Compiler\KeyValueCompiler;
 use Waffle\Commons\Data\Compiler\KeyValueOperation;
 use Waffle\Commons\Data\Driver\KeyValue\KeyValueClientInterface;
@@ -18,6 +21,7 @@ use Waffle\Commons\Data\Hydrator\PropertyHookHydrator;
 use Waffle\Commons\Data\Hydrator\RowNormaliser;
 use Waffle\Commons\Data\Query\Criteria;
 use Waffle\Commons\Data\Query\Query;
+use Waffle\Commons\Data\Telemetry\QueryTracer;
 
 use function array_values;
 use function json_encode;
@@ -47,6 +51,8 @@ final class KeyValueRepository implements WritableRepositoryInterface
 
     private readonly RowNormaliser $normaliser;
 
+    private QueryTracer $queryTracer;
+
     /**
      * @param KeyValueClientInterface     $client   Live transport (e.g. RedisKeyValueClient).
      * @param class-string<T>             $target   `readonly` DTO each document hydrates into.
@@ -62,6 +68,42 @@ final class KeyValueRepository implements WritableRepositoryInterface
     ) {
         $this->hydrator = new PropertyHookHydrator($target);
         $this->normaliser = new RowNormaliser();
+        $this->queryTracer = new QueryTracer(new NullTracer(), 'keyvalue');
+    }
+
+    /**
+     * Return a copy that emits `waffle.db.query` spans through the given tracer
+     * (OBS-01). Tracing is opt-in at wiring time; the no-op default keeps the
+     * hot path free and the returned instance stays immutable across worker
+     * requests.
+     *
+     * @return self<T>
+     */
+    public function withTracer(TracerInterface $tracer): self
+    {
+        $clone = clone $this;
+        $clone->queryTracer = new QueryTracer($tracer, 'keyvalue');
+
+        return $clone;
+    }
+
+    /**
+     * @return list<T>
+     *
+     * @throws Throwable When the lookup is unrepresentable or a row cannot be hydrated.
+     */
+    #[\Override]
+    public function find(QueryInterface $query): array
+    {
+        $span = $this->queryTracer->open('find');
+
+        try {
+            return $this->runFind($query);
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
@@ -72,8 +114,7 @@ final class KeyValueRepository implements WritableRepositoryInterface
      * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
      * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
      */
-    #[\Override]
-    public function find(QueryInterface $query): array
+    private function runFind(QueryInterface $query): array
     {
         $command = $this->compiler->compile($query);
 
@@ -97,91 +138,122 @@ final class KeyValueRepository implements WritableRepositoryInterface
     /**
      * @return T|null
      *
-     * @throws InvalidArgumentException When the query expresses anything a
-     *         key-value store cannot honour.
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
-     * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
+     * @throws Throwable When the lookup is unrepresentable or the row cannot be hydrated.
      */
     #[\Override]
     public function findOne(QueryInterface $query): ?object
     {
-        return $this->find($query)[0] ?? null;
+        $span = $this->queryTracer->open('findOne');
+
+        try {
+            return $this->runFind($query)[0] ?? null;
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
      * @return Generator<int, T>
      *
-     * @throws InvalidArgumentException When the query expresses anything a
-     *         key-value store cannot honour.
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
-     * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
+     * @throws Throwable When the lookup is unrepresentable or a row cannot be hydrated.
      */
     #[\Override]
     public function stream(QueryInterface $query): Generator
     {
-        // A key lookup is already bounded by its key set; yield from that page.
-        yield from $this->find($query);
+        $span = $this->queryTracer->open('stream');
+
+        try {
+            // A key lookup is already bounded by its key set; yield from that page.
+            yield from $this->runFind($query);
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
      * Store the entity as one JSON document under `{namespace}:{id}`. A
      * key-value store has no auto-id, so an identity is mandatory.
      *
-     * @throws InvalidArgumentException When the repository has no mapper or the
-     *         entity carries no identity.
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
+     * @throws Throwable When the repository has no mapper, the entity carries no
+     *         identity, or the backend write fails.
      */
     #[\Override]
     public function save(object $entity): void
     {
-        $mapper = $this->requireMapper();
-        $id = $mapper->identify($entity);
-        if ($id === null) {
-            throw new InvalidArgumentException('A key-value write requires an explicit identity (no auto-id).');
-        }
+        $span = $this->queryTracer->open('save');
 
         try {
-            $value = json_encode($mapper->toRow($entity), JSON_THROW_ON_ERROR);
-        } catch (JsonException $error) {
-            throw DatabaseException::fromThrowable($error, 'Failed to encode the key-value document.');
-        }
+            $mapper = $this->requireMapper();
+            $id = $mapper->identify($entity);
+            if ($id === null) {
+                throw new InvalidArgumentException('A key-value write requires an explicit identity (no auto-id).');
+            }
 
-        $this->client->set($this->key($mapper, $id), $value);
+            try {
+                $value = json_encode($mapper->toRow($entity), JSON_THROW_ON_ERROR);
+            } catch (JsonException $jsonError) {
+                throw DatabaseException::fromThrowable($jsonError, 'Failed to encode the key-value document.');
+            }
+
+            $this->client->set($this->key($mapper, $id), $value);
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
-     * @throws InvalidArgumentException When the repository has no mapper or the
-     *         entity carries no identity.
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
+     * @throws Throwable When the repository has no mapper, the entity carries no
+     *         identity, or the backend write fails.
      */
     #[\Override]
     public function delete(object $entity): void
     {
-        $mapper = $this->requireMapper();
-        $id = $mapper->identify($entity);
-        if ($id === null) {
-            throw new InvalidArgumentException('Cannot delete an entity that carries no identity.');
-        }
+        $span = $this->queryTracer->open('delete');
 
-        $this->client->delete($this->key($mapper, $id));
+        try {
+            $mapper = $this->requireMapper();
+            $id = $mapper->identify($entity);
+            if ($id === null) {
+                throw new InvalidArgumentException('Cannot delete an entity that carries no identity.');
+            }
+
+            $this->client->delete($this->key($mapper, $id));
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
      * @return T|null
      *
-     * @throws InvalidArgumentException When the repository has no mapper.
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
-     * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
+     * @throws Throwable When the repository has no mapper, the backend call
+     *         fails, or the row cannot be hydrated.
      */
     #[\Override]
     public function findById(int|string $id): ?object
     {
-        $mapper = $this->requireMapper();
+        $span = $this->queryTracer->open('findById');
 
-        // Route through the read path so the key is formed by the same compiler.
-        $query = Query::select()->from($mapper->target())->where(Criteria::eq($mapper->identityField(), $id));
+        try {
+            $mapper = $this->requireMapper();
 
-        return $this->find($query)[0] ?? null;
+            // Route through the read path so the key is formed by the same compiler.
+            $query = Query::select()->from($mapper->target())->where(Criteria::eq($mapper->identityField(), $id));
+
+            return $this->runFind($query)[0] ?? null;
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**

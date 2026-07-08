@@ -31,8 +31,8 @@ final class SqlCrudTest extends AbstractTestCase
 
         $this->pool = new PDOConnectionPool(factory: static fn(): PDO => new PDO('sqlite::memory:'));
         $connection = $this->pool->acquire();
-        $connection->exec('CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score REAL)');
-        $connection->exec("INSERT INTO people (id, name, score) VALUES (1, 'alice', 9.5)");
+        $connection->pdo()->exec('CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score REAL)');
+        $connection->pdo()->exec("INSERT INTO people (id, name, score) VALUES (1, 'alice', 9.5)");
         $this->pool->release($connection);
     }
 
@@ -150,7 +150,9 @@ final class SqlCrudTest extends AbstractTestCase
         [$pool, $statement, $pdo] = $this->mockedConnection();
         $pdo->method('beginTransaction')->willReturn(true);
         $pdo->method('prepare')->willReturn($statement);
-        $pdo->method('inTransaction')->willReturn(true);
+        // Real PDO lifecycle: no outer transaction when the write starts (so the
+        // repo owns and begins one), then in-transaction when recovery rolls back.
+        $pdo->method('inTransaction')->willReturn(false, true);
         $pdo->expects(self::once())->method('rollBack')->willReturn(true);
         $statement->method('execute')->willThrowException(new \PDOException('write blew up'));
 
@@ -191,9 +193,14 @@ final class SqlCrudTest extends AbstractTestCase
         [$pool, $statement, $pdo] = $this->mockedConnection();
         $pdo->method('beginTransaction')->willReturn(true);
         $pdo->method('prepare')->willReturn($statement);
-        $pdo->method('inTransaction')->willReturn(true);
+        // No outer transaction at write start (repo owns it), then in-transaction
+        // during recovery so the rollback path is genuinely exercised.
+        $pdo->method('inTransaction')->willReturn(false, true);
         // The connection is already severed — even the rollback throws.
-        $pdo->method('rollBack')->willThrowException(new \PDOException('socket gone'));
+        $pdo
+            ->expects(self::once())
+            ->method('rollBack')
+            ->willThrowException(new \PDOException('socket gone'));
         $statement->method('execute')->willThrowException(new \PDOException('write blew up'));
 
         $repository = new SQLRepository(

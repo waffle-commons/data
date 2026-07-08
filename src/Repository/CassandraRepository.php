@@ -6,14 +6,18 @@ namespace Waffle\Commons\Data\Repository;
 
 use Generator;
 use InvalidArgumentException;
+use Throwable;
 use Waffle\Commons\Contracts\Data\Mapper\DataMapperInterface;
 use Waffle\Commons\Contracts\Data\Query\QueryInterface;
 use Waffle\Commons\Contracts\Data\Repository\WritableRepositoryInterface;
+use Waffle\Commons\Contracts\Telemetry\NullTracer;
+use Waffle\Commons\Contracts\Telemetry\TracerInterface;
 use Waffle\Commons\Data\Compiler\CassandraCompiler;
 use Waffle\Commons\Data\Driver\Cql\CqlSessionInterface;
 use Waffle\Commons\Data\Hydrator\PropertyHookHydrator;
 use Waffle\Commons\Data\Query\Criteria;
 use Waffle\Commons\Data\Query\Query;
+use Waffle\Commons\Data\Telemetry\QueryTracer;
 
 use function array_fill;
 use function array_keys;
@@ -43,6 +47,8 @@ final class CassandraRepository implements WritableRepositoryInterface
     /** @var PropertyHookHydrator<T> */
     private readonly PropertyHookHydrator $hydrator;
 
+    private QueryTracer $queryTracer;
+
     /**
      * @param CqlSessionInterface         $session  Transport (see the port's note on
      *                                              live CQL access from PHP 8.5).
@@ -58,6 +64,42 @@ final class CassandraRepository implements WritableRepositoryInterface
         private readonly ?DataMapperInterface $mapper = null,
     ) {
         $this->hydrator = new PropertyHookHydrator($target);
+        $this->queryTracer = new QueryTracer(new NullTracer(), 'cassandra');
+    }
+
+    /**
+     * Return a copy that emits `waffle.db.query` spans through the given tracer
+     * (OBS-01). Tracing is opt-in at wiring time; the no-op default keeps the
+     * hot path free and the returned instance stays immutable across worker
+     * requests.
+     *
+     * @return self<T>
+     */
+    public function withTracer(TracerInterface $tracer): self
+    {
+        $clone = clone $this;
+        $clone->queryTracer = new QueryTracer($tracer, 'cassandra');
+
+        return $clone;
+    }
+
+    /**
+     * @return list<T>
+     *
+     * @throws Throwable When the backend call fails or a row cannot be hydrated.
+     */
+    #[\Override]
+    public function find(QueryInterface $query): array
+    {
+        $span = $this->queryTracer->open('find');
+
+        try {
+            return $this->runFind($query);
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
@@ -67,8 +109,7 @@ final class CassandraRepository implements WritableRepositoryInterface
      * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
      * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
      */
-    #[\Override]
-    public function find(QueryInterface $query): array
+    private function runFind(QueryInterface $query): array
     {
         $hydrated = [];
         foreach ($this->session->execute($this->compiler->compile($query)) as $row) {
@@ -81,9 +122,7 @@ final class CassandraRepository implements WritableRepositoryInterface
     /**
      * @return T|null
      *
-     * @throws InvalidArgumentException When the query is CQL-incompatible.
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
-     * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
+     * @throws Throwable When the backend call fails or the row cannot be hydrated.
      */
     #[\Override]
     public function findOne(QueryInterface $query): ?object
@@ -92,85 +131,123 @@ final class CassandraRepository implements WritableRepositoryInterface
         // to rebuild — never discard rows client-side.
         $bounded = $query instanceof Query ? $query->limit(1) : $query;
 
-        return $this->find($bounded)[0] ?? null;
+        $span = $this->queryTracer->open('findOne');
+
+        try {
+            return $this->runFind($bounded)[0] ?? null;
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
      * @return Generator<int, T>
      *
-     * @throws InvalidArgumentException When the query is CQL-incompatible.
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
-     * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
+     * @throws Throwable When the backend call fails or a row cannot be hydrated.
      */
     #[\Override]
     public function stream(QueryInterface $query): Generator
     {
-        // Token-based paging lives in the transport; yield from the bounded page.
-        yield from $this->find($query);
+        $span = $this->queryTracer->open('stream');
+
+        try {
+            // Token-based paging lives in the transport; yield from the bounded page.
+            yield from $this->runFind($query);
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
      * Upsert the entity with a single parameterised CQL INSERT (operands bound,
      * never inlined).
      *
-     * @throws InvalidArgumentException When the repository has no mapper or the
-     *         mapped row is empty.
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
+     * @throws Throwable When the repository has no mapper, the mapped row is
+     *         empty, or the backend write fails.
      */
     #[\Override]
     public function save(object $entity): void
     {
-        $mapper = $this->requireMapper();
-        $row = $mapper->toRow($entity);
-        if ($row === []) {
-            throw new InvalidArgumentException('Cannot INSERT an empty row.');
+        $span = $this->queryTracer->open('save');
+
+        try {
+            $mapper = $this->requireMapper();
+            $row = $mapper->toRow($entity);
+            if ($row === []) {
+                throw new InvalidArgumentException('Cannot INSERT an empty row.');
+            }
+
+            $columns = array_keys($row);
+            $cql = sprintf(
+                'INSERT INTO %s (%s) VALUES (%s)',
+                $mapper->target(),
+                implode(', ', $columns),
+                implode(', ', array_fill(0, count($columns), '?')),
+            );
+
+            $this->session->executeWrite($cql, array_values($row));
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
         }
-
-        $columns = array_keys($row);
-        $cql = sprintf(
-            'INSERT INTO %s (%s) VALUES (%s)',
-            $mapper->target(),
-            implode(', ', $columns),
-            implode(', ', array_fill(0, count($columns), '?')),
-        );
-
-        $this->session->executeWrite($cql, array_values($row));
     }
 
     /**
-     * @throws InvalidArgumentException When the repository has no mapper or the
-     *         entity carries no identity.
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
+     * @throws Throwable When the repository has no mapper, the entity carries no
+     *         identity, or the backend write fails.
      */
     #[\Override]
     public function delete(object $entity): void
     {
-        $mapper = $this->requireMapper();
-        $id = $mapper->identify($entity);
-        if ($id === null) {
-            throw new InvalidArgumentException('Cannot delete an entity that carries no identity.');
+        $span = $this->queryTracer->open('delete');
+
+        try {
+            $mapper = $this->requireMapper();
+            $id = $mapper->identify($entity);
+            if ($id === null) {
+                throw new InvalidArgumentException('Cannot delete an entity that carries no identity.');
+            }
+
+            $cql = sprintf('DELETE FROM %s WHERE %s = ?', $mapper->target(), $mapper->identityField());
+
+            $this->session->executeWrite($cql, [$id]);
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
         }
-
-        $cql = sprintf('DELETE FROM %s WHERE %s = ?', $mapper->target(), $mapper->identityField());
-
-        $this->session->executeWrite($cql, [$id]);
     }
 
     /**
      * @return T|null
      *
-     * @throws InvalidArgumentException When the repository has no mapper.
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
-     * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
+     * @throws Throwable When the repository has no mapper, the backend call
+     *         fails, or the row cannot be hydrated.
      */
     #[\Override]
     public function findById(int|string $id): ?object
     {
-        $mapper = $this->requireMapper();
+        $span = $this->queryTracer->open('findById');
 
-        $query = Query::select()->from($mapper->target())->where(Criteria::eq($mapper->identityField(), $id))->limit(1);
+        try {
+            $mapper = $this->requireMapper();
 
-        return $this->find($query)[0] ?? null;
+            $query = Query::select()
+                ->from($mapper->target())
+                ->where(Criteria::eq($mapper->identityField(), $id))
+                ->limit(1);
+
+            return $this->runFind($query)[0] ?? null;
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**

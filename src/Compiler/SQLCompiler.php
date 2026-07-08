@@ -92,6 +92,7 @@ final class SQLCompiler
         return [' WHERE ' . implode(' AND ', $fragments), $parameters];
     }
 
+    /** @throws InvalidArgumentException When an ordering references a malformed identifier. */
     private function orderClause(QueryInterface $query): string
     {
         if ($query->orderings === []) {

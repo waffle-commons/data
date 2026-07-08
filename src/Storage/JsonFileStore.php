@@ -10,6 +10,7 @@ use Waffle\Commons\Data\Evaluation\InMemoryEvaluator;
 use Waffle\Commons\Data\Exception\DatabaseException;
 use Waffle\Commons\Data\Hydrator\RowNormaliser;
 
+use function bin2hex;
 use function dirname;
 use function file_get_contents;
 use function file_put_contents;
@@ -17,9 +18,9 @@ use function is_dir;
 use function is_file;
 use function json_encode;
 use function mb_trim;
+use function random_bytes;
 use function rename;
 use function sprintf;
-use function uniqid;
 use function unlink;
 
 use const JSON_PRETTY_PRINT;
@@ -115,9 +116,15 @@ final class JsonFileStore
             throw new DatabaseException(sprintf('JSON store directory "%s" does not exist.', $directory));
         }
 
-        // Unique-per-writer temp name: uniqueness is what matters here (the name
-        // is not a secret); it lives beside its target so the rename stays atomic.
-        $temp = $path . '.tmp.' . uniqid('', true);
+        // Unique-per-writer temp name beside its target so the rename stays atomic;
+        // bin2hex(random_bytes(6)) gives an unpredictable suffix (DX-01). A missing
+        // entropy source surfaces as the store's own DatabaseException.
+        try {
+            $suffix = bin2hex(random_bytes(6));
+        } catch (\Random\RandomException) {
+            throw new DatabaseException('Unable to generate a unique temp name for the JSON store.');
+        }
+        $temp = $path . '.tmp.' . $suffix;
         if (file_put_contents($temp, $json, LOCK_EX) === false) {
             throw new DatabaseException(sprintf('Failed to write the JSON store temp file "%s".', $temp));
         }

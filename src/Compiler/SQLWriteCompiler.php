@@ -90,6 +90,7 @@ final class SQLWriteCompiler
         return new CompiledWrite($sql, $parameters);
     }
 
+    /** @throws InvalidArgumentException When the table or id-field identifier is malformed. */
     public function compileDelete(string $table, string $idField, int|string $id): CompiledWrite
     {
         $sql = sprintf(

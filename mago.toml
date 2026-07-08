@@ -96,7 +96,7 @@ assert-description = { enabled = false }
 literal-named-argument = { enabled = false }
 no-boolean-flag-parameter = { enabled = false }
 too-many-methods = { enabled = false }
-cyclomatic-complexity = { enabled = false }
+cyclomatic-complexity = { enabled = true, threshold = 50 }
 # Same software-metric family as the two above (method count × complexity): a
 # cohesive single-backend CRUD repository legitimately carries find/findOne/
 # stream/save/delete/findById + helpers. Disabled to match the curated set the

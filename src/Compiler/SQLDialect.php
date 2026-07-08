@@ -4,9 +4,12 @@ declare(strict_types=1);
 
 namespace Waffle\Commons\Data\Compiler;
 
+use InvalidArgumentException;
+
 use function array_map;
 use function explode;
 use function implode;
+use function preg_match;
 use function str_replace;
 
 /**
@@ -27,8 +30,19 @@ enum SQLDialect
     case Oracle;
 
     /**
-     * Quote a (possibly dotted) identifier, escaping the closing quote in every
-     * segment so a crafted column name cannot break out of its quotes.
+     * Allow-list applied to every identifier segment ALONGSIDE quote-escaping
+     * (HARDEN-03): rejects NUL and control characters, which quoting cannot make
+     * safe (truncation / statement-splitting / log injection). Printable quote
+     * characters are still permitted and neutralised by {@see quoteSegment()}.
+     */
+    private const string IDENTIFIER_PATTERN = '/^[^\x00-\x1F\x7F]+$/';
+
+    /**
+     * Quote a (possibly dotted) identifier. Each segment is validated against the
+     * {@see IDENTIFIER_PATTERN} allow-list, then its closing quote is escaped so a
+     * crafted column name can neither smuggle control bytes nor break out.
+     *
+     * @throws InvalidArgumentException When a segment is empty or holds a control character.
      */
     public function quoteIdentifier(string $identifier): string
     {
@@ -59,8 +73,15 @@ enum SQLDialect
         };
     }
 
+    /** @throws InvalidArgumentException When the segment is empty or holds a NUL/control character. */
     private function quoteSegment(string $segment): string
     {
+        if (preg_match(self::IDENTIFIER_PATTERN, $segment) !== 1) {
+            throw new InvalidArgumentException(
+                'Invalid SQL identifier: a segment must be non-empty and free of NUL/control characters.',
+            );
+        }
+
         return match ($this) {
             self::MySQL, self::MariaDB => '`' . str_replace('`', '``', $segment) . '`',
             self::SQLite, self::PostgreSQL, self::Oracle => '"' . str_replace('"', '""', $segment) . '"',

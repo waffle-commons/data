@@ -6,14 +6,18 @@ namespace Waffle\Commons\Data\Repository;
 
 use Generator;
 use InvalidArgumentException;
+use Throwable;
 use Waffle\Commons\Contracts\Data\Mapper\DataMapperInterface;
 use Waffle\Commons\Contracts\Data\Query\QueryInterface;
 use Waffle\Commons\Contracts\Data\Repository\WritableRepositoryInterface;
+use Waffle\Commons\Contracts\Telemetry\NullTracer;
+use Waffle\Commons\Contracts\Telemetry\TracerInterface;
 use Waffle\Commons\Data\Compiler\MongoCompiler;
 use Waffle\Commons\Data\Driver\Mongo\MongoSessionInterface;
 use Waffle\Commons\Data\Hydrator\PropertyHookHydrator;
 use Waffle\Commons\Data\Query\Criteria;
 use Waffle\Commons\Data\Query\Query;
+use Waffle\Commons\Data\Telemetry\QueryTracer;
 
 /**
  * Stateless repository over a MongoDB backend (RFC-022 §3 + §4.2).
@@ -32,6 +36,8 @@ final class MongoRepository implements WritableRepositoryInterface
     /** @var PropertyHookHydrator<T> */
     private readonly PropertyHookHydrator $hydrator;
 
+    private QueryTracer $queryTracer;
+
     /**
      * @param MongoSessionInterface       $session  Transport (live: MongoDriverSession).
      * @param class-string<T>             $target   `readonly` DTO each document hydrates into.
@@ -46,6 +52,42 @@ final class MongoRepository implements WritableRepositoryInterface
         private readonly ?DataMapperInterface $mapper = null,
     ) {
         $this->hydrator = new PropertyHookHydrator($target);
+        $this->queryTracer = new QueryTracer(new NullTracer(), 'mongodb');
+    }
+
+    /**
+     * Return a copy that emits `waffle.db.query` spans through the given tracer
+     * (OBS-01). Tracing is opt-in at wiring time; the no-op default keeps the
+     * hot path free and the returned instance stays immutable across worker
+     * requests.
+     *
+     * @return self<T>
+     */
+    public function withTracer(TracerInterface $tracer): self
+    {
+        $clone = clone $this;
+        $clone->queryTracer = new QueryTracer($tracer, 'mongodb');
+
+        return $clone;
+    }
+
+    /**
+     * @return list<T>
+     *
+     * @throws Throwable When the backend call fails or a document cannot be hydrated.
+     */
+    #[\Override]
+    public function find(QueryInterface $query): array
+    {
+        $span = $this->queryTracer->open('find');
+
+        try {
+            return $this->runFind($query);
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
@@ -55,8 +97,7 @@ final class MongoRepository implements WritableRepositoryInterface
      * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
      * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
      */
-    #[\Override]
-    public function find(QueryInterface $query): array
+    private function runFind(QueryInterface $query): array
     {
         $hydrated = [];
         foreach ($this->session->find($this->compiler->compile($query)) as $row) {
@@ -69,9 +110,7 @@ final class MongoRepository implements WritableRepositoryInterface
     /**
      * @return T|null
      *
-     * @throws InvalidArgumentException When the query has no source collection.
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
-     * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
+     * @throws Throwable When the backend call fails or the document cannot be hydrated.
      */
     #[\Override]
     public function findOne(QueryInterface $query): ?object
@@ -80,77 +119,115 @@ final class MongoRepository implements WritableRepositoryInterface
         // discard documents client-side.
         $bounded = $query instanceof Query ? $query->limit(1) : $query;
 
-        return $this->find($bounded)[0] ?? null;
+        $span = $this->queryTracer->open('findOne');
+
+        try {
+            return $this->runFind($bounded)[0] ?? null;
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
      * @return Generator<int, T>
      *
-     * @throws InvalidArgumentException When the query has no source collection.
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
-     * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
+     * @throws Throwable When the backend call fails or a document cannot be hydrated.
      */
     #[\Override]
     public function stream(QueryInterface $query): Generator
     {
-        // The session port returns a bounded page; yield from it.
-        yield from $this->find($query);
+        $span = $this->queryTracer->open('stream');
+
+        try {
+            // The session port returns a bounded page; yield from it.
+            yield from $this->runFind($query);
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
      * Insert (null identity) or replace-upsert (by identity) the document.
      *
-     * @throws InvalidArgumentException When the repository has no mapper.
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
+     * @throws Throwable When the repository has no mapper or the backend write fails.
      */
     #[\Override]
     public function save(object $entity): void
     {
-        $mapper = $this->requireMapper();
-        $id = $mapper->identify($entity);
-        $row = $mapper->toRow($entity);
+        $span = $this->queryTracer->open('save');
 
-        if ($id === null) {
-            $this->session->insert($mapper->target(), $row);
+        try {
+            $mapper = $this->requireMapper();
+            $id = $mapper->identify($entity);
+            $row = $mapper->toRow($entity);
 
-            return;
+            if ($id === null) {
+                $this->session->insert($mapper->target(), $row);
+
+                return;
+            }
+
+            $this->session->upsert($mapper->target(), $mapper->identityField(), $id, $row);
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
         }
-
-        $this->session->upsert($mapper->target(), $mapper->identityField(), $id, $row);
     }
 
     /**
-     * @throws InvalidArgumentException When the repository has no mapper or the
-     *         entity carries no identity.
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
+     * @throws Throwable When the repository has no mapper, the entity carries no
+     *         identity, or the backend write fails.
      */
     #[\Override]
     public function delete(object $entity): void
     {
-        $mapper = $this->requireMapper();
-        $id = $mapper->identify($entity);
-        if ($id === null) {
-            throw new InvalidArgumentException('Cannot delete an entity that carries no identity.');
-        }
+        $span = $this->queryTracer->open('delete');
 
-        $this->session->deleteOne($mapper->target(), $mapper->identityField(), $id);
+        try {
+            $mapper = $this->requireMapper();
+            $id = $mapper->identify($entity);
+            if ($id === null) {
+                throw new InvalidArgumentException('Cannot delete an entity that carries no identity.');
+            }
+
+            $this->session->deleteOne($mapper->target(), $mapper->identityField(), $id);
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
      * @return T|null
      *
-     * @throws InvalidArgumentException When the repository has no mapper.
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
-     * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
+     * @throws Throwable When the repository has no mapper, the backend call
+     *         fails, or the document cannot be hydrated.
      */
     #[\Override]
     public function findById(int|string $id): ?object
     {
-        $mapper = $this->requireMapper();
+        $span = $this->queryTracer->open('findById');
 
-        $query = Query::select()->from($mapper->target())->where(Criteria::eq($mapper->identityField(), $id))->limit(1);
+        try {
+            $mapper = $this->requireMapper();
 
-        return $this->find($query)[0] ?? null;
+            $query = Query::select()
+                ->from($mapper->target())
+                ->where(Criteria::eq($mapper->identityField(), $id))
+                ->limit(1);
+
+            return $this->runFind($query)[0] ?? null;
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**

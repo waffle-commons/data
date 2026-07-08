@@ -9,10 +9,13 @@ use InvalidArgumentException;
 use PDO;
 use PDOException;
 use PDOStatement;
-use Waffle\Commons\Contracts\Data\Connection\ConnectionPoolInterface;
+use Throwable;
+use Waffle\Commons\Contracts\Data\Connection\RelationalConnectionPoolInterface;
 use Waffle\Commons\Contracts\Data\Mapper\DataMapperInterface;
 use Waffle\Commons\Contracts\Data\Query\QueryInterface;
 use Waffle\Commons\Contracts\Data\Repository\WritableRepositoryInterface;
+use Waffle\Commons\Contracts\Telemetry\NullTracer;
+use Waffle\Commons\Contracts\Telemetry\TracerInterface;
 use Waffle\Commons\Data\Compiler\CompiledQuery;
 use Waffle\Commons\Data\Compiler\CompiledWrite;
 use Waffle\Commons\Data\Compiler\SQLCompiler;
@@ -22,6 +25,7 @@ use Waffle\Commons\Data\Hydrator\PropertyHookHydrator;
 use Waffle\Commons\Data\Hydrator\RowNormaliser;
 use Waffle\Commons\Data\Query\Criteria;
 use Waffle\Commons\Data\Query\Query;
+use Waffle\Commons\Data\Telemetry\QueryTracer;
 
 use function is_bool;
 use function is_int;
@@ -52,8 +56,10 @@ final class SQLRepository implements WritableRepositoryInterface
 
     private readonly SQLWriteCompiler $writeCompiler;
 
+    private QueryTracer $queryTracer;
+
     /**
-     * @param ConnectionPoolInterface     $pool          Worker-safe PDO pool.
+     * @param RelationalConnectionPoolInterface $pool          Worker-safe relational pool.
      * @param class-string<T>             $target        `readonly` DTO each row hydrates into.
      * @param SQLCompiler                 $compiler      Dialect-aware read (SELECT) compiler.
      * @param DataMapperInterface<T>|null $mapper        Write/identity mapper; omit for a read-only
@@ -63,7 +69,7 @@ final class SQLRepository implements WritableRepositoryInterface
      *                                                   compiler's dialect (defaults to MySQL).
      */
     public function __construct(
-        private readonly ConnectionPoolInterface $pool,
+        private readonly RelationalConnectionPoolInterface $pool,
         string $target,
         private readonly SQLCompiler $compiler = new SQLCompiler(),
         private readonly ?DataMapperInterface $mapper = null,
@@ -72,6 +78,42 @@ final class SQLRepository implements WritableRepositoryInterface
         $this->hydrator = new PropertyHookHydrator($target);
         $this->normaliser = new RowNormaliser();
         $this->writeCompiler = $writeCompiler ?? new SQLWriteCompiler();
+        $this->queryTracer = new QueryTracer(new NullTracer(), 'sql');
+    }
+
+    /**
+     * Return a copy that emits `waffle.db.query` spans through the given tracer
+     * (OBS-01). Tracing is opt-in at wiring time; the no-op default keeps the
+     * hot path free and the returned instance stays immutable across worker
+     * requests.
+     *
+     * @return self<T>
+     */
+    public function withTracer(TracerInterface $tracer): self
+    {
+        $clone = clone $this;
+        $clone->queryTracer = new QueryTracer($tracer, 'sql');
+
+        return $clone;
+    }
+
+    /**
+     * @return list<T>
+     *
+     * @throws Throwable When the backend call fails or a row cannot be hydrated.
+     */
+    #[\Override]
+    public function find(QueryInterface $query): array
+    {
+        $span = $this->queryTracer->open('find');
+
+        try {
+            return $this->runFind($query);
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
@@ -82,11 +124,11 @@ final class SQLRepository implements WritableRepositoryInterface
      * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
      * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
      */
-    #[\Override]
-    public function find(QueryInterface $query): array
+    private function runFind(QueryInterface $query): array
     {
         $compiled = $this->compiler->compile($query);
-        $connection = $this->pool->acquire();
+        $lease = $this->pool->acquire();
+        $connection = $lease->pdo();
 
         try {
             $statement = $this->execute($connection, $compiled);
@@ -95,7 +137,7 @@ final class SQLRepository implements WritableRepositoryInterface
         } catch (PDOException $error) {
             throw DatabaseException::fromThrowable($error, 'Failed to execute the find query.');
         } finally {
-            $this->pool->release($connection);
+            $this->pool->release($lease);
         }
 
         $hydrated = [];
@@ -109,10 +151,7 @@ final class SQLRepository implements WritableRepositoryInterface
     /**
      * @return T|null
      *
-     * @throws InvalidArgumentException When the query cannot be represented on
-     *         this backend (e.g. it has no source table).
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
-     * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
+     * @throws Throwable When the backend call fails or the row cannot be hydrated.
      */
     #[\Override]
     public function findOne(QueryInterface $query): ?object
@@ -121,60 +160,110 @@ final class SQLRepository implements WritableRepositoryInterface
         // discard rows client-side.
         $bounded = $query instanceof Query ? $query->limit(1) : $query;
 
-        return $this->find($bounded)[0] ?? null;
+        $span = $this->queryTracer->open('findOne');
+
+        try {
+            return $this->runFind($bounded)[0] ?? null;
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
-     * @throws InvalidArgumentException When the repository has no mapper, or an
-     *         INSERT row / UPDATE assignment set is empty.
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
+     * @throws Throwable When the repository has no mapper or the backend write fails.
      */
     #[\Override]
     public function save(object $entity): void
     {
-        $mapper = $this->requireMapper();
-        $id = $mapper->identify($entity);
-        $row = $mapper->toRow($entity);
+        $span = $this->queryTracer->open('save');
 
-        $compiled = $id === null
-            ? $this->writeCompiler->compileInsert($mapper->target(), $row)
-            : $this->writeCompiler->compileUpdate($mapper->target(), $row, $mapper->identityField(), $id);
+        try {
+            $mapper = $this->requireMapper();
+            $id = $mapper->identify($entity);
+            $row = $mapper->toRow($entity);
 
-        $this->executeWrite($compiled);
+            $compiled = $id === null
+                ? $this->writeCompiler->compileInsert($mapper->target(), $row)
+                : $this->writeCompiler->compileUpdate($mapper->target(), $row, $mapper->identityField(), $id);
+
+            $this->executeWrite($compiled);
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
-     * @throws InvalidArgumentException When the repository has no mapper, or the
-     *         entity carries no identity to delete by.
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
+     * @throws Throwable When the repository has no mapper, the entity carries no
+     *         identity, or the backend write fails.
      */
     #[\Override]
     public function delete(object $entity): void
     {
-        $mapper = $this->requireMapper();
-        $id = $mapper->identify($entity);
-        if ($id === null) {
-            throw new InvalidArgumentException('Cannot delete an entity that carries no identity.');
-        }
+        $span = $this->queryTracer->open('delete');
 
-        $this->executeWrite($this->writeCompiler->compileDelete($mapper->target(), $mapper->identityField(), $id));
+        try {
+            $mapper = $this->requireMapper();
+            $id = $mapper->identify($entity);
+            if ($id === null) {
+                throw new InvalidArgumentException('Cannot delete an entity that carries no identity.');
+            }
+
+            $this->executeWrite($this->writeCompiler->compileDelete($mapper->target(), $mapper->identityField(), $id));
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
      * @return T|null
      *
-     * @throws InvalidArgumentException When the repository has no mapper.
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
-     * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
+     * @throws Throwable When the repository has no mapper, the backend call
+     *         fails, or the row cannot be hydrated.
      */
     #[\Override]
     public function findById(int|string $id): ?object
     {
-        $mapper = $this->requireMapper();
+        $span = $this->queryTracer->open('findById');
 
-        $query = Query::select()->from($mapper->target())->where(Criteria::eq($mapper->identityField(), $id))->limit(1);
+        try {
+            $mapper = $this->requireMapper();
 
-        return $this->find($query)[0] ?? null;
+            $query = Query::select()
+                ->from($mapper->target())
+                ->where(Criteria::eq($mapper->identityField(), $id))
+                ->limit(1);
+
+            return $this->runFind($query)[0] ?? null;
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
+    }
+
+    /**
+     * @return Generator<int, T>
+     *
+     * @throws Throwable When the backend call fails or a row cannot be hydrated.
+     */
+    #[\Override]
+    public function stream(QueryInterface $query): Generator
+    {
+        $span = $this->queryTracer->open('stream');
+
+        try {
+            yield from $this->runStream($query);
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
@@ -185,11 +274,11 @@ final class SQLRepository implements WritableRepositoryInterface
      * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
      * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
      */
-    #[\Override]
-    public function stream(QueryInterface $query): Generator
+    private function runStream(QueryInterface $query): Generator
     {
         $compiled = $this->compiler->compile($query);
-        $connection = $this->pool->acquire();
+        $lease = $this->pool->acquire();
+        $connection = $lease->pdo();
 
         try {
             $statement = $this->execute($connection, $compiled);
@@ -202,7 +291,7 @@ final class SQLRepository implements WritableRepositoryInterface
         } finally {
             // Runs on completion, on failure, and when the consumer abandons
             // the generator early — the handle always returns to the pool.
-            $this->pool->release($connection);
+            $this->pool->release($lease);
         }
     }
 
@@ -272,10 +361,20 @@ final class SQLRepository implements WritableRepositoryInterface
      */
     private function executeWrite(CompiledWrite $compiled): void
     {
-        $connection = $this->pool->acquire();
+        $lease = $this->pool->acquire();
+        $connection = $lease->pdo();
+
+        // DBAL-01: when an outer transaction is already open (the failsafe
+        // TransactionIsolationMiddleware pinned this connection and began one),
+        // enlist in it — never open or commit a nested one. The outer scope owns
+        // the commit/rollback so this write becomes part of it and is rolled back
+        // with the request on failure.
+        $ownsTransaction = !$connection->inTransaction();
 
         try {
-            $connection->beginTransaction();
+            if ($ownsTransaction) {
+                $connection->beginTransaction();
+            }
 
             $statement = $connection->prepare($compiled->sql);
             if ($statement === false) {
@@ -289,17 +388,24 @@ final class SQLRepository implements WritableRepositoryInterface
             }
 
             $statement->execute();
-            $connection->commit();
+
+            if ($ownsTransaction) {
+                $connection->commit();
+            }
         } catch (PDOException $error) {
-            $this->rollBack($connection);
+            if ($ownsTransaction) {
+                $this->rollBack($connection);
+            }
 
             throw DatabaseException::fromThrowable($error, 'Failed to execute the compiled write.');
         } catch (DatabaseException $error) {
-            $this->rollBack($connection);
+            if ($ownsTransaction) {
+                $this->rollBack($connection);
+            }
 
             throw $error;
         } finally {
-            $this->pool->release($connection);
+            $this->pool->release($lease);
         }
     }
 

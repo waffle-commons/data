@@ -6,15 +6,19 @@ namespace Waffle\Commons\Data\Repository;
 
 use Generator;
 use InvalidArgumentException;
+use Throwable;
 use Waffle\Commons\Contracts\Data\Mapper\DataMapperInterface;
 use Waffle\Commons\Contracts\Data\Query\QueryInterface;
 use Waffle\Commons\Contracts\Data\Repository\WritableRepositoryInterface;
+use Waffle\Commons\Contracts\Telemetry\NullTracer;
+use Waffle\Commons\Contracts\Telemetry\TracerInterface;
 use Waffle\Commons\Data\Compiler\GraphQLCompiler;
 use Waffle\Commons\Data\Compiler\GraphQLMutationCompiler;
 use Waffle\Commons\Data\Driver\Graph\GraphQLExecutor;
 use Waffle\Commons\Data\Hydrator\PropertyHookHydrator;
 use Waffle\Commons\Data\Query\Criteria;
 use Waffle\Commons\Data\Query\Query;
+use Waffle\Commons\Data\Telemetry\QueryTracer;
 
 /**
  * Stateless repository over a GraphQL endpoint (RFC-022 §3 + §4.3): the
@@ -34,6 +38,8 @@ final class GraphQLRepository implements WritableRepositoryInterface
 
     private readonly GraphQLMutationCompiler $mutationCompiler;
 
+    private QueryTracer $queryTracer;
+
     /**
      * @param GraphQLExecutor             $executor Live PSR-18 network executor.
      * @param class-string<T>             $target   `readonly` DTO each row hydrates into.
@@ -49,6 +55,42 @@ final class GraphQLRepository implements WritableRepositoryInterface
     ) {
         $this->hydrator = new PropertyHookHydrator($target);
         $this->mutationCompiler = new GraphQLMutationCompiler();
+        $this->queryTracer = new QueryTracer(new NullTracer(), 'graphql');
+    }
+
+    /**
+     * Return a copy that emits `waffle.db.query` spans through the given tracer
+     * (OBS-01). Tracing is opt-in at wiring time; the no-op default keeps the
+     * hot path free and the returned instance stays immutable across worker
+     * requests.
+     *
+     * @return self<T>
+     */
+    public function withTracer(TracerInterface $tracer): self
+    {
+        $clone = clone $this;
+        $clone->queryTracer = new QueryTracer($tracer, 'graphql');
+
+        return $clone;
+    }
+
+    /**
+     * @return list<T>
+     *
+     * @throws Throwable When the backend call fails or a row cannot be hydrated.
+     */
+    #[\Override]
+    public function find(QueryInterface $query): array
+    {
+        $span = $this->queryTracer->open('find');
+
+        try {
+            return $this->runFind($query);
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
@@ -59,8 +101,7 @@ final class GraphQLRepository implements WritableRepositoryInterface
      * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
      * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
      */
-    #[\Override]
-    public function find(QueryInterface $query): array
+    private function runFind(QueryInterface $query): array
     {
         $hydrated = [];
         foreach ($this->executor->execute($this->compiler->compile($query)) as $row) {
@@ -73,10 +114,7 @@ final class GraphQLRepository implements WritableRepositoryInterface
     /**
      * @return T|null
      *
-     * @throws InvalidArgumentException When the query cannot be represented as
-     *         GraphQL (no root field, no projection, or an invalid name).
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
-     * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
+     * @throws Throwable When the backend call fails or the row cannot be hydrated.
      */
     #[\Override]
     public function findOne(QueryInterface $query): ?object
@@ -85,86 +123,119 @@ final class GraphQLRepository implements WritableRepositoryInterface
         // discard rows client-side.
         $bounded = $query instanceof Query ? $query->limit(1) : $query;
 
-        return $this->find($bounded)[0] ?? null;
+        $span = $this->queryTracer->open('findOne');
+
+        try {
+            return $this->runFind($bounded)[0] ?? null;
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
      * @return Generator<int, T>
      *
-     * @throws InvalidArgumentException When the query cannot be represented as
-     *         GraphQL (no root field, no projection, or an invalid name).
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
-     * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
+     * @throws Throwable When the backend call fails or a row cannot be hydrated.
      */
     #[\Override]
     public function stream(QueryInterface $query): Generator
     {
-        // GraphQL has no row cursor; yield from the (bounded) result page.
-        yield from $this->find($query);
+        $span = $this->queryTracer->open('stream');
+
+        try {
+            // GraphQL has no row cursor; yield from the (bounded) result page.
+            yield from $this->runFind($query);
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
      * Insert (null identity) or update-by-pk (by identity) via a Hasura-style
      * parameterised mutation.
      *
-     * @throws InvalidArgumentException When the repository has no mapper or the
-     *         target/identity name is not a valid GraphQL name.
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
+     * @throws Throwable When the repository has no mapper or the backend write fails.
      */
     #[\Override]
     public function save(object $entity): void
     {
-        $mapper = $this->requireMapper();
-        $id = $mapper->identify($entity);
-        $row = $mapper->toRow($entity);
+        $span = $this->queryTracer->open('save');
 
-        $mutation = $id === null
-            ? $this->mutationCompiler->compileInsert($mapper->target(), $mapper->identityField(), $row)
-            : $this->mutationCompiler->compileUpdate($mapper->target(), $mapper->identityField(), $id, $row);
+        try {
+            $mapper = $this->requireMapper();
+            $id = $mapper->identify($entity);
+            $row = $mapper->toRow($entity);
 
-        $this->executor->mutate($mutation);
+            $mutation = $id === null
+                ? $this->mutationCompiler->compileInsert($mapper->target(), $mapper->identityField(), $row)
+                : $this->mutationCompiler->compileUpdate($mapper->target(), $mapper->identityField(), $id, $row);
+
+            $this->executor->mutate($mutation);
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
-     * @throws InvalidArgumentException When the repository has no mapper, the
-     *         entity carries no identity, or the target name is invalid.
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
+     * @throws Throwable When the repository has no mapper, the entity carries no
+     *         identity, or the backend write fails.
      */
     #[\Override]
     public function delete(object $entity): void
     {
-        $mapper = $this->requireMapper();
-        $id = $mapper->identify($entity);
-        if ($id === null) {
-            throw new InvalidArgumentException('Cannot delete an entity that carries no identity.');
-        }
+        $span = $this->queryTracer->open('delete');
 
-        $this->executor->mutate($this->mutationCompiler->compileDelete(
-            $mapper->target(),
-            $mapper->identityField(),
-            $id,
-        ));
+        try {
+            $mapper = $this->requireMapper();
+            $id = $mapper->identify($entity);
+            if ($id === null) {
+                throw new InvalidArgumentException('Cannot delete an entity that carries no identity.');
+            }
+
+            $this->executor->mutate($this->mutationCompiler->compileDelete(
+                $mapper->target(),
+                $mapper->identityField(),
+                $id,
+            ));
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**
      * @return T|null
      *
-     * @throws InvalidArgumentException When the repository has no mapper.
-     * @throws \Waffle\Commons\Contracts\Data\Exception\DatabaseExceptionInterface
-     * @throws \Waffle\Commons\Contracts\Exception\Validation\ValidationExceptionInterface
+     * @throws Throwable When the repository has no mapper, the backend call
+     *         fails, or the row cannot be hydrated.
      */
     #[\Override]
     public function findById(int|string $id): ?object
     {
-        $mapper = $this->requireMapper();
+        $span = $this->queryTracer->open('findById');
 
-        // GraphQL requires an explicit projection; take it from the mapper.
-        $query = Query::select(...$mapper->fields())
-            ->from($mapper->target())
-            ->where(Criteria::eq($mapper->identityField(), $id))
-            ->limit(1);
+        try {
+            $mapper = $this->requireMapper();
 
-        return $this->find($query)[0] ?? null;
+            // GraphQL requires an explicit projection; take it from the mapper.
+            $query = Query::select(...$mapper->fields())
+                ->from($mapper->target())
+                ->where(Criteria::eq($mapper->identityField(), $id))
+                ->limit(1);
+
+            return $this->runFind($query)[0] ?? null;
+        } catch (Throwable $error) {
+            $this->queryTracer->fail($span, $error);
+        } finally {
+            $span->end();
+        }
     }
 
     /**

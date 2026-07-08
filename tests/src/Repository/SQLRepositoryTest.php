@@ -36,8 +36,8 @@ final class SQLRepositoryTest extends AbstractTestCase
         // idle set so every repository call reuses the very same connection.
         $this->pool = new PDOConnectionPool(factory: static fn(): PDO => new PDO('sqlite::memory:'));
         $connection = $this->pool->acquire();
-        $connection->exec('CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score REAL)');
-        $connection->exec(
+        $connection->pdo()->exec('CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score REAL)');
+        $connection->pdo()->exec(
             "INSERT INTO people (id, name, score) VALUES (1, 'alice', 9.5), (2, 'bob', NULL), (3, 'carol', 7.25)",
         );
         $this->pool->release($connection);
@@ -120,8 +120,8 @@ final class SQLRepositoryTest extends AbstractTestCase
         // travels as PDO::PARAM_NULL and, per SQL semantics, `= NULL` matches
         // nothing.
         $connection = $this->pool->acquire();
-        $connection->exec('CREATE TABLE flags (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score REAL)');
-        $connection->exec("INSERT INTO flags (id, name, score) VALUES (1, 'on', 1.0), (0, 'off', 2.0)");
+        $connection->pdo()->exec('CREATE TABLE flags (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score REAL)');
+        $connection->pdo()->exec("INSERT INTO flags (id, name, score) VALUES (1, 'on', 1.0), (0, 'off', 2.0)");
         $this->pool->release($connection);
 
         $repository = new SQLRepository($this->pool, PersonRow::class, new SQLCompiler(SQLDialect::SQLite));
@@ -138,7 +138,7 @@ final class SQLRepositoryTest extends AbstractTestCase
         // float column comes back as a string; the Property-Hook hydration
         // layer must reject it, never widen it.
         $connection = $this->pool->acquire();
-        $connection->exec("INSERT INTO people (id, name, score) VALUES (4, 'dave', 'poison')");
+        $connection->pdo()->exec("INSERT INTO people (id, name, score) VALUES (4, 'dave', 'poison')");
         $this->pool->release($connection);
 
         $this->expectException(ValidationExceptionInterface::class);

@@ -6,13 +6,16 @@ namespace WaffleTests\Commons\Data\Crud;
 
 use InvalidArgumentException;
 use PHPUnit\Framework\Attributes\CoversClass;
+use Waffle\Commons\Data\Compiler\CassandraCompiler;
 use Waffle\Commons\Data\Repository\CassandraRepository;
 use WaffleTests\Commons\Data\AbstractTestCase;
 use WaffleTests\Commons\Data\Fixture\FakeCqlSession;
+use WaffleTests\Commons\Data\Fixture\HostileIdentifierPersonMapper;
 use WaffleTests\Commons\Data\Fixture\PersonMapper;
 use WaffleTests\Commons\Data\Fixture\PersonRow;
 
 #[CoversClass(CassandraRepository::class)]
+#[CoversClass(CassandraCompiler::class)]
 final class CassandraCrudTest extends AbstractTestCase
 {
     public function testSaveCompilesAParameterisedUpsertInsert(): void
@@ -22,7 +25,9 @@ final class CassandraCrudTest extends AbstractTestCase
 
         $repository->save(new PersonRow(7, 'ada', 9.5));
 
-        self::assertSame('INSERT INTO people (id, name, score) VALUES (?, ?, ?)', $session->lastWriteCql);
+        // FIX-01: table/column names route through the same quoting the read
+        // path uses (see CassandraRepositoryTest), instead of raw sprintf.
+        self::assertSame('INSERT INTO "people" ("id", "name", "score") VALUES (?, ?, ?)', $session->lastWriteCql);
         self::assertSame([7, 'ada', 9.5], $session->lastWriteParameters);
     }
 
@@ -33,8 +38,33 @@ final class CassandraCrudTest extends AbstractTestCase
 
         $repository->delete(new PersonRow(7, 'ada', 9.5));
 
-        self::assertSame('DELETE FROM people WHERE id = ?', $session->lastWriteCql);
+        self::assertSame('DELETE FROM "people" WHERE "id" = ?', $session->lastWriteCql);
         self::assertSame([7], $session->lastWriteParameters);
+    }
+
+    public function testSaveRejectsAHostileTableAndColumnNameConsistentlyWithTheReadPath(): void
+    {
+        // FIX-01: CassandraCompiler::quoteSegment() now allow-lists identifiers
+        // (not just escape-then-embed), so the hostile payload never reaches CQL
+        // on the write path either — it's rejected at the source, consistently
+        // with the read path, instead of surviving as an escaped-but-present
+        // identifier token.
+        $session = new FakeCqlSession();
+        $repository = new CassandraRepository($session, PersonRow::class, mapper: new HostileIdentifierPersonMapper());
+
+        $this->expectException(InvalidArgumentException::class);
+
+        $repository->save(new PersonRow(7, 'ada', 9.5));
+    }
+
+    public function testDeleteRejectsAHostileTableAndIdentityFieldConsistentlyWithTheReadPath(): void
+    {
+        $session = new FakeCqlSession();
+        $repository = new CassandraRepository($session, PersonRow::class, mapper: new HostileIdentifierPersonMapper());
+
+        $this->expectException(InvalidArgumentException::class);
+
+        $repository->delete(new PersonRow(7, 'ada', 9.5));
     }
 
     public function testFindByIdHydratesTheReturnedRow(): void

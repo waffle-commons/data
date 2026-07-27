@@ -14,6 +14,7 @@ use function array_map;
 use function count;
 use function explode;
 use function implode;
+use function preg_match;
 use function sprintf;
 use function str_replace;
 
@@ -30,6 +31,17 @@ use function str_replace;
  */
 final class CassandraCompiler
 {
+    /**
+     * Strict allow-list applied to every identifier segment ALONGSIDE quote
+     * escaping (FIX-01), mirroring {@see SQLDialect::IDENTIFIER_PATTERN}: a bare
+     * CQL identifier is one or more ASCII letters/digits/underscores that does
+     * not start with a digit. Escaping the quote character alone still let
+     * control bytes and other punctuation through — safe against breaking OUT
+     * of the quoted identifier, but not against statement-splitting/log-
+     * injection/truncation via characters embedded WITHIN it.
+     */
+    private const string IDENTIFIER_PATTERN = '/^[a-zA-Z_][a-zA-Z0-9_]*$/';
+
     /**
      * @throws InvalidArgumentException When the query has no source table, uses
      *         OFFSET pagination, or carries a CQL-incompatible predicate.
@@ -63,6 +75,10 @@ final class CassandraCompiler
         return new CompiledCassandraQuery($cql, $parameters, $query->criteria !== []);
     }
 
+    /**
+     * @throws InvalidArgumentException When a field name is empty or holds a
+     *         character outside the identifier allow-list.
+     */
     private function projection(QueryInterface $query): string
     {
         if ($query->fields === []) {
@@ -99,8 +115,9 @@ final class CassandraCompiler
     /**
      * @return array{string, list<int|float|string|bool|null>}
      *
-     * @throws InvalidArgumentException When the operator is CQL-incompatible or a
-     *         set predicate carries no values.
+     * @throws InvalidArgumentException When the operator is CQL-incompatible, a
+     *         set predicate carries no values, or the field name holds a
+     *         character outside the identifier allow-list.
      */
     private function predicate(ComparisonInterface $comparison): array
     {
@@ -141,6 +158,10 @@ final class CassandraCompiler
         };
     }
 
+    /**
+     * @throws InvalidArgumentException When an ordering field is empty or holds
+     *         a character outside the identifier allow-list.
+     */
     private function orderClause(QueryInterface $query): string
     {
         if ($query->orderings === []) {
@@ -160,13 +181,35 @@ final class CassandraCompiler
         return $query->limit === null ? '' : ' LIMIT ' . $query->limit;
     }
 
-    private function quoteIdentifier(string $identifier): string
+    /**
+     * Quote a (possibly dotted) CQL identifier. Public (FIX-01) so a repository's
+     * own write path (`save()` / `delete()`) can route table/column/identity
+     * names through the exact same validation and escaping the read path
+     * already uses here, instead of splicing them into CQL unquoted.
+     *
+     * @throws InvalidArgumentException When a segment is empty or holds a
+     *         character outside the allow-list.
+     */
+    public function quoteIdentifier(string $identifier): string
     {
         return implode('.', array_map($this->quoteSegment(...), explode('.', $identifier)));
     }
 
+    /**
+     * @throws InvalidArgumentException When the segment is empty or holds a
+     *         character outside the ASCII letter/digit/underscore allow-list.
+     */
     private function quoteSegment(string $segment): string
     {
+        if (preg_match(self::IDENTIFIER_PATTERN, $segment) !== 1) {
+            throw new InvalidArgumentException(
+                'Invalid CQL identifier: a segment must start with an ASCII letter or underscore and '
+                . 'contain only ASCII letters, digits, and underscores.',
+            );
+        }
+
+        // The allow-list above already excludes `"`, so this can never fire in
+        // practice — kept as defence-in-depth (FIX-01) should it ever be relaxed.
         return '"' . str_replace('"', '""', $segment) . '"';
     }
 }

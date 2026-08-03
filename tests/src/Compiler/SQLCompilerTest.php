@@ -184,6 +184,8 @@ final class SQLCompilerTest extends AbstractTestCase
     public static function hostileIdentifierProvider(): iterable
     {
         yield 'backslash' => ['col\\umn'];
+        yield 'trailing newline (PCRE $ anchor hole)' => ["users\n"];
+        yield 'newline then payload' => ["users\n-- "];
         yield 'semicolon (statement splitting)' => ['id; DROP TABLE users; --'];
         yield 'double quote' => ['a"b'];
         yield 'bracket' => ['a]b'];

@@ -40,7 +40,11 @@ final class CassandraCompiler
      * of the quoted identifier, but not against statement-splitting/log-
      * injection/truncation via characters embedded WITHIN it.
      */
-    private const string IDENTIFIER_PATTERN = '/^[a-zA-Z_][a-zA-Z0-9_]*$/';
+    // The `D` modifier is load-bearing, not decoration: without it PCRE's `$`
+    // also matches immediately BEFORE a trailing newline, so "users\n" would
+    // satisfy this allow-list and reach the quoting path — defeating the very
+    // strictness this constant exists to provide.
+    private const string IDENTIFIER_PATTERN = '/^[a-zA-Z_][a-zA-Z0-9_]*$/D';
 
     /**
      * @throws InvalidArgumentException When the query has no source table, uses

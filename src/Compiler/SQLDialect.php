@@ -40,7 +40,11 @@ enum SQLDialect
      * Rejecting anything outside the allow-list closes that vector at the source
      * instead of depending solely on escaping.
      */
-    private const string IDENTIFIER_PATTERN = '/^[a-zA-Z_][a-zA-Z0-9_]*$/';
+    // The `D` modifier is load-bearing, not decoration: without it PCRE's `$`
+    // also matches immediately BEFORE a trailing newline, so "users\n" would
+    // satisfy this allow-list and reach the quoting path — defeating the very
+    // strictness this constant exists to provide.
+    private const string IDENTIFIER_PATTERN = '/^[a-zA-Z_][a-zA-Z0-9_]*$/D';
 
     /**
      * Quote a (possibly dotted) identifier. Each segment is validated against the

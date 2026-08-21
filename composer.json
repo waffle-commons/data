@@ -1,6 +1,6 @@
 {
     "name": "waffle-commons/data",
-    "description": "Data component for Waffle framework.",
+    "description": "The data and persistence layer for Waffle Commons (RFC-022): a warm connection pool, a backend-agnostic query AST, and parameterized SQL / CQL / MongoDB / Firestore / key-value / GraphQL compilers for resident-worker mode.",
     "type": "library",
     "license": "MIT",
     "autoload": {

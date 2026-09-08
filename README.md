@@ -10,7 +10,7 @@
 Waffle Data Component
 =====================
 
-> **Release:** `0.1.0-beta5` &nbsp;|&nbsp; [`CHANGELOG.md`](./CHANGELOG.md)
+> **Release:** `0.1.0-beta6` &nbsp;|&nbsp; [`CHANGELOG.md`](./CHANGELOG.md)
 
 The data & persistence layer for the Waffle Framework (RFC-022). Built for FrankenPHP resident-worker mode: a warm connection pool, a backend-agnostic query AST, parameterized SQL / Firestore compilers, a property-hook hydrator, and a stateless SQL migration runner. **No stateful ORM, no identity map, no change tracking** — a row becomes an immutable value object and nothing more.
 
@@ -130,6 +130,14 @@ docker exec -w /waffle-commons/data waffle-dev composer tests
 ```
 
 The full gate (`composer mago && composer tests`) runs format, lint, analyze, guard, and PHPUnit (≥95% line coverage) with zero baselines.
+
+## 📚 Documentation
+
+Central framework docs (Diátaxis) for this component:
+
+- Reference: [`reference/data.md`](https://github.com/waffle-commons/documentation/blob/main/reference/data.md), [`reference/connection-pool.md`](https://github.com/waffle-commons/documentation/blob/main/reference/connection-pool.md)
+- Explanation: [`explanation/data-persistence.md`](https://github.com/waffle-commons/documentation/blob/main/explanation/data-persistence.md), [`explanation/connection-pooling.md`](https://github.com/waffle-commons/documentation/blob/main/explanation/connection-pooling.md)
+- Full documentation tree: [waffle-commons/documentation](https://github.com/waffle-commons/documentation)
 
 ## 📄 License
 

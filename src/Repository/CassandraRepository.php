@@ -21,6 +21,7 @@ use Waffle\Commons\Data\Telemetry\QueryTracer;
 
 use function array_fill;
 use function array_keys;
+use function array_map;
 use function array_values;
 use function count;
 use function implode;
@@ -164,7 +165,9 @@ final class CassandraRepository implements WritableRepositoryInterface
 
     /**
      * Upsert the entity with a single parameterised CQL INSERT (operands bound,
-     * never inlined).
+     * never inlined). Table and column names route through the same
+     * {@see CassandraCompiler::quoteIdentifier()} the read path uses (FIX-01),
+     * rather than being spliced into the CQL unquoted.
      *
      * @throws Throwable When the repository has no mapper, the mapped row is
      *         empty, or the backend write fails.
@@ -182,10 +185,11 @@ final class CassandraRepository implements WritableRepositoryInterface
             }
 
             $columns = array_keys($row);
+            $quotedColumns = array_map($this->compiler->quoteIdentifier(...), $columns);
             $cql = sprintf(
                 'INSERT INTO %s (%s) VALUES (%s)',
-                $mapper->target(),
-                implode(', ', $columns),
+                $this->compiler->quoteIdentifier($mapper->target()),
+                implode(', ', $quotedColumns),
                 implode(', ', array_fill(0, count($columns), '?')),
             );
 
@@ -198,6 +202,10 @@ final class CassandraRepository implements WritableRepositoryInterface
     }
 
     /**
+     * Table and identity-field names route through the same
+     * {@see CassandraCompiler::quoteIdentifier()} the read path uses (FIX-01),
+     * rather than being spliced into the CQL unquoted.
+     *
      * @throws Throwable When the repository has no mapper, the entity carries no
      *         identity, or the backend write fails.
      */
@@ -213,7 +221,11 @@ final class CassandraRepository implements WritableRepositoryInterface
                 throw new InvalidArgumentException('Cannot delete an entity that carries no identity.');
             }
 
-            $cql = sprintf('DELETE FROM %s WHERE %s = ?', $mapper->target(), $mapper->identityField());
+            $cql = sprintf(
+                'DELETE FROM %s WHERE %s = ?',
+                $this->compiler->quoteIdentifier($mapper->target()),
+                $this->compiler->quoteIdentifier($mapper->identityField()),
+            );
 
             $this->session->executeWrite($cql, [$id]);
         } catch (Throwable $error) {

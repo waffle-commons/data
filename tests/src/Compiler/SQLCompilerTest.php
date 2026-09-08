@@ -168,21 +168,66 @@ final class SQLCompilerTest extends AbstractTestCase
         self::assertStringNotContainsString('DROP', $compiled->sql);
     }
 
-    public function testMaliciousIdentifierQuoteIsEscaped(): void
+    public function testIdentifierWithBacktickIsRejectedOutright(): void
     {
-        // A crafted column name cannot break out of its identifier quoting.
-        $compiled = new SQLCompiler()->compile(Query::select('a`b')->from('t'));
-
-        self::assertSame('SELECT `a``b` FROM `t`', $compiled->sql);
-    }
-
-    public function testIdentifierWithControlCharacterIsRejected(): void
-    {
-        // HARDEN-03: a NUL/control byte cannot be neutralised by quoting, so the
-        // dialect rejects it outright (allow-list alongside escaping).
+        // FIX-01: a crafted column name can no longer reach the escaper at all —
+        // the strict allow-list rejects anything but letters/digits/underscores,
+        // so it never gets a chance to try breaking out of its identifier quoting.
         $this->expectException(InvalidArgumentException::class);
 
-        SQLDialect::MySQL->quoteIdentifier("col\x00umn");
+        new SQLCompiler()->compile(Query::select('a`b')->from('t'));
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function hostileIdentifierProvider(): iterable
+    {
+        yield 'backslash' => ['col\\umn'];
+        yield 'trailing newline (PCRE $ anchor hole)' => ["users\n"];
+        yield 'newline then payload' => ["users\n-- "];
+        yield 'semicolon (statement splitting)' => ['id; DROP TABLE users; --'];
+        yield 'double quote' => ['a"b'];
+        yield 'bracket' => ['a]b'];
+        yield 'space' => ['a b'];
+        yield 'leading digit' => ['1id'];
+        yield 'NUL byte' => ["col\x00umn"];
+        yield 'control character' => ["col\x1Fumn"];
+        yield 'empty segment' => [''];
+    }
+
+    #[DataProvider('hostileIdentifierProvider')]
+    public function testHostileIdentifierIsRejected(string $identifier): void
+    {
+        // FIX-01: anything outside the ASCII letter/digit/underscore allow-list is
+        // rejected at the source, closing the identifier-injection vector rather
+        // than relying solely on dialect quote-escaping.
+        $this->expectException(InvalidArgumentException::class);
+
+        SQLDialect::MySQL->quoteIdentifier($identifier);
+    }
+
+    /**
+     * @return iterable<string, array{string, string}>
+     */
+    public static function legitimateIdentifierProvider(): iterable
+    {
+        yield 'lowercase word' => ['users', '`users`'];
+        yield 'leading underscore' => ['_private', '`_private`'];
+        yield 'snake_case with digits' => ['user_id_2', '`user_id_2`'];
+        yield 'all caps' => ['USERS', '`USERS`'];
+        yield 'single letter' => ['a', '`a`'];
+    }
+
+    #[DataProvider('legitimateIdentifierProvider')]
+    public function testLegitimateIdentifierIsAccepted(string $identifier, string $expected): void
+    {
+        self::assertSame($expected, SQLDialect::MySQL->quoteIdentifier($identifier));
+    }
+
+    public function testLegitimateDottedIdentifierIsAccepted(): void
+    {
+        self::assertSame('`schema_1`.`table_2`', SQLDialect::MySQL->quoteIdentifier('schema_1.table_2'));
     }
 
     /**

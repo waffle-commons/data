@@ -30,19 +30,31 @@ enum SQLDialect
     case Oracle;
 
     /**
-     * Allow-list applied to every identifier segment ALONGSIDE quote-escaping
-     * (HARDEN-03): rejects NUL and control characters, which quoting cannot make
-     * safe (truncation / statement-splitting / log injection). Printable quote
-     * characters are still permitted and neutralised by {@see quoteSegment()}.
+     * Strict allow-list applied to every identifier segment ALONGSIDE dialect
+     * quote-escaping (FIX-01, hardening the earlier HARDEN-03 control): a bare SQL
+     * identifier is one or more ASCII letters/digits/underscores that does not
+     * start with a digit. The previous NUL/control-character-only deny-list still
+     * let punctuation (quotes, backticks, brackets, semicolons, backslashes …)
+     * through to {@see quoteSegment()}'s escaping — safe in the common case, but a
+     * single missed dialect-quoting edge case turns into identifier injection.
+     * Rejecting anything outside the allow-list closes that vector at the source
+     * instead of depending solely on escaping.
      */
-    private const string IDENTIFIER_PATTERN = '/^[^\x00-\x1F\x7F]+$/';
+    // The `D` modifier is load-bearing, not decoration: without it PCRE's `$`
+    // also matches immediately BEFORE a trailing newline, so "users\n" would
+    // satisfy this allow-list and reach the quoting path — defeating the very
+    // strictness this constant exists to provide.
+    private const string IDENTIFIER_PATTERN = '/^[a-zA-Z_][a-zA-Z0-9_]*$/D';
 
     /**
      * Quote a (possibly dotted) identifier. Each segment is validated against the
-     * {@see IDENTIFIER_PATTERN} allow-list, then its closing quote is escaped so a
-     * crafted column name can neither smuggle control bytes nor break out.
+     * {@see IDENTIFIER_PATTERN} allow-list — rejecting anything but ASCII
+     * letters/digits/underscores — before the dialect's quote character wraps it,
+     * so a crafted column name can neither smuggle punctuation/control bytes nor
+     * break out of its quoting.
      *
-     * @throws InvalidArgumentException When a segment is empty or holds a control character.
+     * @throws InvalidArgumentException When a segment is empty or holds a
+     *         character outside the allow-list.
      */
     public function quoteIdentifier(string $identifier): string
     {
@@ -73,17 +85,25 @@ enum SQLDialect
         };
     }
 
-    /** @throws InvalidArgumentException When the segment is empty or holds a NUL/control character. */
+    /**
+     * @throws InvalidArgumentException When the segment is empty or holds a
+     *         character outside the ASCII letter/digit/underscore allow-list.
+     */
     private function quoteSegment(string $segment): string
     {
         if (preg_match(self::IDENTIFIER_PATTERN, $segment) !== 1) {
             throw new InvalidArgumentException(
-                'Invalid SQL identifier: a segment must be non-empty and free of NUL/control characters.',
+                'Invalid SQL identifier: a segment must start with an ASCII letter or underscore and '
+                . 'contain only ASCII letters, digits, and underscores.',
             );
         }
 
         return match ($this) {
-            self::MySQL, self::MariaDB => '`' . str_replace('`', '``', $segment) . '`',
+            // The allow-list above already excludes backslash and backtick, so
+            // neither can reach here — the escaping stays as defence-in-depth
+            // (FIX-01) should the allow-list ever be relaxed, and mirrors how
+            // MySQL/MariaDB treat a backslash inside a quoted identifier.
+            self::MySQL, self::MariaDB => '`' . str_replace(['\\', '`'], ['\\\\', '``'], $segment) . '`',
             self::SQLite, self::PostgreSQL, self::Oracle => '"' . str_replace('"', '""', $segment) . '"',
             self::MSSQL => '[' . str_replace(']', ']]', $segment) . ']',
         };

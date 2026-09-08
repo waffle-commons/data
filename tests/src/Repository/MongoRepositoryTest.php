@@ -31,8 +31,10 @@ final class MongoRepositoryTest extends AbstractTestCase
 
         self::assertContainsOnlyInstancesOf(PersonRow::class, $people);
         self::assertSame([1, 2], array_map(static fn(PersonRow $person): int => $person->id, $people));
-        self::assertSame('people', $session->lastQuery?->collection);
-        self::assertSame(['name' => ['$eq' => 'alice']], $session->lastQuery?->filter);
+        $query = $session->lastQuery;
+        self::assertNotNull($query);
+        self::assertSame('people', $query->collection);
+        self::assertSame(['name' => ['$eq' => 'alice']], $query->filter);
     }
 
     public function testFindOneBoundsTheCallServerSide(): void

@@ -32,9 +32,14 @@ final class CassandraRepositoryTest extends AbstractTestCase
 
         self::assertContainsOnlyInstancesOf(PersonRow::class, $people);
         self::assertSame(['alice'], array_map(static fn(PersonRow $person): string => $person->name, $people));
-        self::assertSame('SELECT * FROM "people" WHERE "name" = ?', $session->lastQuery?->cql);
-        self::assertSame(['alice'], $session->lastQuery?->parameters);
-        self::assertTrue($session->lastQuery?->requiresAllowFiltering);
+        // Capturé une fois puis asserté non nul : les accès qui suivent sont de
+        // simples `->`, ce qu'acceptent aussi bien l'ancien que le nouvel
+        // analyseur (l'un exige le `?->`, l'autre le déclare redondant).
+        $query = $session->lastQuery;
+        self::assertNotNull($query);
+        self::assertSame('SELECT * FROM "people" WHERE "name" = ?', $query->cql);
+        self::assertSame(['alice'], $query->parameters);
+        self::assertTrue($query->requiresAllowFiltering);
     }
 
     public function testFindOneBoundsTheCallWithCqlLimit(): void

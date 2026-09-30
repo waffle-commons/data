@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Waffle\Commons\Data\Telemetry;
 
+use IgorPhp\IgorBundle\Attribute\WorkerSafe;
 use Throwable;
 use Waffle\Commons\Contracts\Telemetry\Enum\SpanKind;
 use Waffle\Commons\Contracts\Telemetry\Enum\SpanStatus;
@@ -34,6 +35,9 @@ final readonly class QueryTracer
      * Start a query span tagged with the backend system and the logical
      * operation (`find`, `findOne`, `stream`, `save`, `delete`, `findById`).
      */
+    #[WorkerSafe(
+        reason: 'starts one span per query through the injected tracer; the attributes go to that span, which the caller ends',
+    )]
     public function open(string $operation): SpanInterface
     {
         $span = $this->tracer->startSpan('waffle.db.query', SpanKind::Client);

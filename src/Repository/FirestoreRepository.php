@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Waffle\Commons\Data\Repository;
 
 use Generator;
+use IgorPhp\IgorBundle\Attribute\WorkerSafe;
 use InvalidArgumentException;
 use Throwable;
 use Waffle\Commons\Contracts\Auth\SecurityContextInterface;
@@ -286,6 +287,9 @@ final class FirestoreRepository implements WritableRepositoryInterface
      * @throws Throwable When the caller is anonymous or the backend write fails.
      */
     #[\Override]
+    #[WorkerSafe(
+        reason: 'writes through the injected Firestore client to the backend by design; no worker memory is mutated',
+    )]
     public function save(object $entity): void
     {
         $span = $this->queryTracer->open('save');

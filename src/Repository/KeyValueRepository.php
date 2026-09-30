@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Waffle\Commons\Data\Repository;
 
 use Generator;
+use IgorPhp\IgorBundle\Attribute\WorkerSafe;
 use InvalidArgumentException;
 use JsonException;
 use Throwable;
@@ -182,6 +183,9 @@ final class KeyValueRepository implements WritableRepositoryInterface
      *         identity, or the backend write fails.
      */
     #[\Override]
+    #[WorkerSafe(
+        reason: 'writes through the injected key-value client to the backend by design; no worker memory is mutated',
+    )]
     public function save(object $entity): void
     {
         $span = $this->queryTracer->open('save');

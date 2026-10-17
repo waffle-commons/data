@@ -9,6 +9,7 @@ Released in lockstep with the Waffle Commons umbrella tag.
 
 ### Added
 - `Health\ConnectionPoolHealthCheck` (OPS-01, RFC-023 §3.3) — the `/readyz` probe for a connection pool: it leases one connection and gives it back, so it costs one round trip and never opens a connection of its own (heal-on-lease already pings). It serves the relational pool (`db.pool`) and the Redis pool alike; a pool that cannot lease is reported down with the reason, never thrown.
+- `RateLimit\RedisLimiterStateStorage` (NET-01, RFC-024 §5.1) — the shared token buckets behind `LimiterStateStorageInterface`: one Lua script refills and takes atomically on the Redis server clock, through the framework's Redis pool. Measured on 2026-10-17: 8 concurrent processes, 200 calls on a bucket of 50 → exactly 50 admitted. Failures surface as `RateLimit\StateStorageException` (implements `StateStorageExceptionInterface`).
 
 ## [0.1.0-beta6] — 2026-09
 

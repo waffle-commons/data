@@ -5,6 +5,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Released in lockstep with the Waffle Commons umbrella tag.
 
+## [Unreleased]
+
+### Added
+- `Health\ConnectionPoolHealthCheck` (OPS-01, RFC-023 §3.3) — the `/readyz` probe for a connection pool: it leases one connection and gives it back, so it costs one round trip and never opens a connection of its own (heal-on-lease already pings). It serves the relational pool (`db.pool`) and the Redis pool alike; a pool that cannot lease is reported down with the reason, never thrown.
+
 ## [0.1.0-beta6] — 2026-09
 
 **Theme: identifier-quoting hardening.**

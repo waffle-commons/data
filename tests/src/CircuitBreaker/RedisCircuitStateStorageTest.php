@@ -94,6 +94,23 @@ final class RedisCircuitStateStorageTest extends AbstractTestCase
         static::assertTrue($storage->acquire('up', $policy)->allowed);
     }
 
+    public function testATrialThatRecordsNothingGivesItsSlotBackAfterACoolDown(): void
+    {
+        $storage = $this->storage();
+        $policy = new CircuitBreakerPolicy(100, 1, 60, 1, 1);
+        $storage->record('up', $policy, false);
+
+        usleep(1_100_000);
+        static::assertTrue($storage->acquire('up', $policy)->allowed, 'the trial, never recorded');
+        static::assertFalse($storage->acquire('up', $policy)->allowed, 'its slot is taken');
+
+        usleep(1_100_000);
+        $again = $storage->acquire('up', $policy);
+        static::assertTrue($again->allowed);
+        static::assertSame(CircuitState::HalfOpen, $again->state);
+        static::assertFalse($storage->acquire('up', $policy)->allowed, 'one trial at a time again');
+    }
+
     public function testAFailedTrialOpensTheCircuitAgain(): void
     {
         $storage = $this->storage();

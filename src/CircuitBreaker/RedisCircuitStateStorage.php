@@ -17,8 +17,13 @@ use Waffle\Commons\Data\RateLimit\StateStorageException;
  * Circuit breakers in Redis ([NET-03], RFC-024 §3.2, §5.1): each operation is one Lua script on the Redis
  * server clock, so every worker agrees on each circuit and on each transition.
  *
- * A circuit is a hash: `state`, `opened_at`, `trials` (half-open admissions), and the failure window
- * (`window_start`, `calls`, `failures`). It expires once nothing can depend on it any more.
+ * A circuit is a hash: `state`, `opened_at`, `trials` (half-open admissions) and `trial_at` (the last one),
+ * and the failure window (`window_start`, `calls`, `failures`). It expires once nothing can depend on it any
+ * more.
+ *
+ * Half-open trials that record no outcome within a cool-down give their slots back: a worker that died
+ * mid-call, or a call whose outcome says nothing about the upstream, never holds the circuit half-open,
+ * refusing every call, until the hash expires.
  */
 final readonly class RedisCircuitStateStorage implements CircuitStateStorageInterface
 {
@@ -30,7 +35,7 @@ final readonly class RedisCircuitStateStorage implements CircuitStateStorageInte
         local cool_down = tonumber(ARGV[1])
         local trials_max = tonumber(ARGV[2])
         local ttl = tonumber(ARGV[3])
-        local s = redis.call('HMGET', KEYS[1], 'state', 'opened_at', 'trials')
+        local s = redis.call('HMGET', KEYS[1], 'state', 'opened_at', 'trials', 'trial_at')
         local state = s[1] or 'closed'
         local previous = ''
         if state == 'open' then
@@ -45,8 +50,12 @@ final readonly class RedisCircuitStateStorage implements CircuitStateStorageInte
         if state == 'closed' then
             return {1, 'closed', previous}
         end
-        if (tonumber(s[3]) or 0) < trials_max then
-            redis.call('HINCRBY', KEYS[1], 'trials', 1)
+        local trials = tonumber(s[3]) or 0
+        if trials >= trials_max and now >= (tonumber(s[4]) or 0) + cool_down then
+            trials = 0
+        end
+        if trials < trials_max then
+            redis.call('HSET', KEYS[1], 'trials', trials + 1, 'trial_at', tostring(now))
             redis.call('EXPIRE', KEYS[1], ttl)
             return {1, 'half_open', previous}
         end

@@ -100,7 +100,7 @@ $user = $hydrator->hydrate(['id' => '42', 'email' => 'ada@example.com']); // Use
 
 ### Run migrations (from the CLI)
 
-`MigrationRunner` is wired into the console as `bin/waffle db:migrate` (see the [`console`](https://github.com/waffle-commons/console) component). Programmatically:
+`MigrationRunner` is wired into the console as `bin/waffle db:migrate`, `db:status` and `db:rollback`, and `make:migration` scaffolds a version (see the [`console`](https://github.com/waffle-commons/console) component). A version `V` is the file `V.sql`; its optional `V.down.sql` reverts it. Programmatically:
 
 ```php
 use Waffle\Commons\Data\Migration\MigrationRunner;
@@ -108,7 +108,12 @@ use Waffle\Commons\Data\Migration\MigrationRunner;
 $runner = new MigrationRunner(pool: $pool, config: $config);
 $applied = $runner->run(static fn (string $version) => printf("applied %s\n", $version));
 // $applied: list of versions applied this run ([] when already up to date)
+
+$states = $runner->status();      // list<MigrationState>: applied, pending or missing, in version order
+$reverted = $runner->rollback(2); // the two most recent versions, highest first, through their down scripts
 ```
+
+A script that holds only comments is refused, never logged, and `rollback()` reads every targeted down script before it reverts anything.
 
 ## 🐘 PHP 8.5 features used
 

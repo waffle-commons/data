@@ -27,12 +27,14 @@ use function basename;
 use function file_get_contents;
 use function glob;
 use function is_file;
+use function preg_replace;
 use function rsort;
 use function rtrim;
 use function sort;
 use function sprintf;
 use function str_ends_with;
 use function substr;
+use function trim;
 
 use const SORT_STRING;
 
@@ -49,6 +51,10 @@ use const SORT_STRING;
  * A version `V` is the file `V.sql`; `V.down.sql`, when present, is its down
  * script. {@see self::rollback()} reverts the most recent versions through those
  * scripts, and {@see self::status()} reports applied, pending and missing versions.
+ *
+ * A script holding only comments and blank lines is refused, never recorded: on
+ * PostgreSQL and SQLite it would run as a no-op, so a scaffolded file left unedited
+ * (`make:migration`) would be logged as applied, or as reverted, with no schema change.
  *
  * There is no identity map, no schema diffing and no filesystem scan during a
  * request: discovery happens only when the CLI calls the runner.
@@ -100,7 +106,7 @@ final class MigrationRunner implements MigrationRunnerInterface
                     continue;
                 }
 
-                $this->execute($connection, $ledger->insert(), $version, $scripts['up'], 'Migration');
+                $this->execute($connection, $ledger->insert(), $version, $this->scriptOf($scripts['up']), 'Migration');
                 $performed[] = $version;
 
                 if ($onApplied !== null) {
@@ -142,17 +148,17 @@ final class MigrationRunner implements MigrationRunnerInterface
             rsort($versions, SORT_STRING);
             $targets = array_slice($versions, 0, $steps);
 
-            // Check every target before reverting any, so a missing down script
-            // never leaves the schema half rolled back.
+            // Read every target's down script before reverting any, so a missing or
+            // empty one never leaves the schema half rolled back.
             $discovered = $this->discover();
             $downScripts = [];
             foreach ($targets as $version) {
-                $downScripts[$version] = $this->downScriptOf($version, $discovered);
+                $downScripts[$version] = $this->scriptOf($this->downScriptOf($version, $discovered));
             }
 
             $reverted = [];
-            foreach ($downScripts as $version => $path) {
-                $this->execute($connection, $ledger->delete(), $version, $path, 'Rollback of');
+            foreach ($downScripts as $version => $sql) {
+                $this->execute($connection, $ledger->delete(), $version, $sql, 'Rollback of');
                 $reverted[] = $version;
 
                 if ($onReverted !== null) {
@@ -333,19 +339,49 @@ final class MigrationRunner implements MigrationRunnerInterface
     }
 
     /**
-     * Run one script inside its own transaction, then apply the ledger statement
-     * (record or erase the version) before committing.
+     * The SQL of one script, read once it is due to run.
      *
-     * @throws DatabaseException When the file cannot be read or the script fails
-     *         (the transaction is rolled back before this throws).
+     * @throws DatabaseException When the file cannot be read or holds no SQL statement.
      */
-    private function execute(PDO $connection, string $ledgerSql, string $version, string $path, string $action): void
+    private function scriptOf(string $path): string
     {
         $sql = file_get_contents($path);
         if ($sql === false) {
             throw new DatabaseException(sprintf('Unable to read migration file "%s".', $path));
         }
 
+        if (!self::hasStatement($sql)) {
+            throw new DatabaseException(sprintf(
+                'Migration file "%s" holds no SQL statement, only comments or blank lines: write it or delete it.',
+                $path,
+            ));
+        }
+
+        return $sql;
+    }
+
+    /**
+     * Whether anything but `--` and `/* … *\/` comments, whitespace and semicolons is left.
+     * A comment marker inside a string literal can only remove text after a statement has
+     * started, so a real statement is never mistaken for an empty script.
+     */
+    private static function hasStatement(string $sql): bool
+    {
+        $code = preg_replace('~/\*.*?\*/|--[^\n]*~s', '', $sql);
+
+        // A PCRE failure (backtrack limit) leaves the decision to the database engine.
+        return $code === null || trim($code, " \t\n\r\0\x0B;") !== '';
+    }
+
+    /**
+     * Run one script inside its own transaction, then apply the ledger statement
+     * (record or erase the version) before committing.
+     *
+     * @throws DatabaseException When the script fails (the transaction is rolled
+     *         back before this throws).
+     */
+    private function execute(PDO $connection, string $ledgerSql, string $version, string $sql, string $action): void
+    {
         try {
             $connection->beginTransaction();
             $connection->exec($sql);

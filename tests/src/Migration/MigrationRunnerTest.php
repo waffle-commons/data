@@ -130,6 +130,40 @@ final class MigrationRunnerTest extends AbstractTestCase
         self::assertTrue($this->tableExists($pdo, 'ok'));
     }
 
+    public function testAScriptWithOnlyCommentsIsRefusedAndNeverRecorded(): void
+    {
+        $this->writeMigration('001_users.sql', 'CREATE TABLE users (id INTEGER PRIMARY KEY);');
+        $this->writeMigration('002_unedited.sql', "-- 002_unedited (up)\n/* to be written */\n;\n");
+
+        $pdo = $this->sqlite();
+        $runner = new MigrationRunner($this->poolFor($pdo), $this->configFor($this->migrationsDir));
+
+        try {
+            $runner->run();
+            self::fail('Expected a DatabaseException for the script without a statement.');
+        } catch (DatabaseException $exception) {
+            self::assertStringContainsString('002_unedited.sql" holds no SQL statement', $exception->getMessage());
+        }
+
+        self::assertSame(['001_users'], $this->loggedVersions($pdo));
+    }
+
+    public function testCommentsAroundAStatementDoNotHideIt(): void
+    {
+        $this->writeMigration(
+            '001_notes.sql',
+            "-- header\n/* block\n comment */ CREATE TABLE notes (body TEXT);\n"
+            . "INSERT INTO notes (body) VALUES ('a -- b /* c'); -- trailing\n",
+        );
+
+        $pdo = $this->sqlite();
+        $runner = new MigrationRunner($this->poolFor($pdo), $this->configFor($this->migrationsDir));
+
+        self::assertSame(['001_notes'], $runner->run());
+        $statement = $pdo->query('SELECT body FROM notes');
+        self::assertSame('a -- b /* c', $statement === false ? null : $statement->fetchColumn());
+    }
+
     public function testEmptyDirectoryProvisionsLogButAppliesNothing(): void
     {
         $pdo = $this->sqlite();
@@ -215,6 +249,24 @@ final class MigrationRunnerTest extends AbstractTestCase
         }
 
         // 002 had a down script, but the check runs before anything is reverted.
+        self::assertTrue($this->tableExists($pdo, 'posts'));
+        self::assertSame(['001_users', '002_posts'], $this->loggedVersions($pdo));
+    }
+
+    public function testRollbackRevertsNothingWhenOneTargetDownScriptIsEmpty(): void
+    {
+        $pdo = $this->sqlite();
+        $runner = $this->migratedPair($pdo);
+        $this->writeMigration('001_users.down.sql', "-- 001_users (down)\n");
+
+        try {
+            $runner->rollback(2);
+            self::fail('Expected a DatabaseException for the empty down script.');
+        } catch (DatabaseException $exception) {
+            self::assertStringContainsString('001_users.down.sql" holds no SQL statement', $exception->getMessage());
+        }
+
+        // 002's down script was valid, but every target is read before anything is reverted.
         self::assertTrue($this->tableExists($pdo, 'posts'));
         self::assertSame(['001_users', '002_posts'], $this->loggedVersions($pdo));
     }

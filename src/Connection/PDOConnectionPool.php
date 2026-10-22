@@ -17,8 +17,10 @@ use Waffle\Commons\Contracts\Service\ResettableInterface;
 use Waffle\Commons\Data\Exception\DatabaseException;
 
 use function array_fill_keys;
+use function array_intersect_key;
 use function array_keys;
 use function count;
+use function microtime;
 use function spl_object_id;
 use function sprintf;
 
@@ -32,7 +34,9 @@ use function sprintf;
  *  - **Ping-before-dispense** — every connection is probed with a lightweight
  *    `SELECT 1` before it leaves the pool; a connection whose socket has dropped
  *    is discarded and transparently replaced, so a stale handle never reaches
- *    the caller.
+ *    the caller. With a freshness window ([CARRY-01]) a connection proven alive
+ *    less than `$pingFreshnessMs` ago leaves without the probe; an older one is
+ *    still probed.
  *  - **Reset between requests** — {@see self::reset()} rolls back any dangling
  *    transaction, returns borrowed handles to the idle set, clears the
  *    prepared-statement cache, and drops any request-scoped affinity, leaving no
@@ -80,6 +84,16 @@ final class PDOConnectionPool implements RelationalConnectionPoolInterface, Rese
     private array $issued = [];
 
     /**
+     * When each connection was last proven alive, as `microtime(true)`: when it
+     * was created or last answered the ping ([CARRY-01]). Only "proven" counts —
+     * a connection coming back from a lease may be one the request found dead,
+     * and the pool never sees the caller's errors.
+     *
+     * @var array<int, float>
+     */
+    private array $verifiedAt = [];
+
+    /**
      * Request-scoped pinned lease (DBAL-01). While set, {@see self::acquire()}
      * returns this same lease and {@see self::release()} of it is a no-op, so the
      * failsafe transaction middleware can open ONE transaction that every
@@ -100,17 +114,29 @@ final class PDOConnectionPool implements RelationalConnectionPoolInterface, Rese
      *                                        zero overhead in production; a dev wiring injects
      *                                        a tracker so a borrowed-but-never-released handle
      *                                        is surfaced at request end.
+     * @param int $pingFreshnessMs            How long, in milliseconds, a connection proven
+     *                                        alive (created, or answered the ping) is dispensed
+     *                                        again without a new ping ([CARRY-01]). 0, the
+     *                                        default, pings on every dispense. The trade-off: a
+     *                                        connection the database dropped can fail requests
+     *                                        for up to this long after it was last proven alive;
+     *                                        an older one is pinged and, if dead, replaced.
      *
-     * @throws DatabaseException When $maxConnections is below 1.
+     * @throws DatabaseException When $maxConnections is below 1 or $pingFreshnessMs is negative.
      */
     public function __construct(
         private readonly Closure $factory,
         private readonly int $maxConnections = 8,
         private readonly string $pingQuery = 'SELECT 1',
         private readonly ?ConnectionTrackerInterface $tracker = null,
+        private readonly int $pingFreshnessMs = 0,
     ) {
         if ($maxConnections < 1) {
             throw new DatabaseException('A connection pool must allow at least one connection.');
+        }
+
+        if ($pingFreshnessMs < 0) {
+            throw new DatabaseException('The ping freshness window cannot be negative.');
         }
     }
 
@@ -209,7 +235,7 @@ final class PDOConnectionPool implements RelationalConnectionPoolInterface, Rese
     {
         foreach ($this->idle as $id => $connection) {
             unset($this->idle[$id]);
-            if ($this->isAlive($connection)) {
+            if ($this->isFresh($id) || $this->verify($id, $connection)) {
                 $this->inUse[$id] = $connection;
                 $this->issued[$id] = true;
                 $this->tracker?->trackOpen($this->traceId($id), ConnectionKind::Pdo);
@@ -289,6 +315,8 @@ final class PDOConnectionPool implements RelationalConnectionPoolInterface, Rese
         // they survive the request and stay ours to reclaim (DBAL-03), while any
         // discarded handle's mark is dropped — so the set never grows unbounded.
         $this->issued = array_fill_keys(array_keys($this->idle), true);
+        // The warm handles keep their proof of life across requests; nothing else does.
+        $this->verifiedAt = array_intersect_key($this->verifiedAt, $this->idle);
     }
 
     /** Number of warm, idle connections currently held. */
@@ -319,6 +347,8 @@ final class PDOConnectionPool implements RelationalConnectionPoolInterface, Rese
         $id = spl_object_id($connection);
         $this->inUse[$id] = $connection;
         $this->issued[$id] = true;
+        // Connecting proves the connection alive, as a ping would.
+        $this->verifiedAt[$id] = microtime(true);
         $this->tracker?->trackOpen($this->traceId($id), ConnectionKind::Pdo);
 
         return $connection;
@@ -351,10 +381,28 @@ final class PDOConnectionPool implements RelationalConnectionPoolInterface, Rese
     }
 
     /**
-     * Lightweight liveness probe: a connection that cannot answer the ping query
-     * is considered dead and will be recycled by the caller.
+     * True when the connection was proven alive less than `$pingFreshnessMs` ago
+     * ([CARRY-01]), so it may leave without the probe. A clock that moved
+     * backwards makes the proof stale, never fresh.
      */
-    private function isAlive(PDO $connection): bool
+    private function isFresh(int $id): bool
+    {
+        $verifiedAt = $this->verifiedAt[$id] ?? null;
+        if ($this->pingFreshnessMs === 0 || $verifiedAt === null) {
+            return false;
+        }
+
+        $elapsedMs = (microtime(true) - $verifiedAt) * 1000;
+
+        return $elapsedMs >= 0 && $elapsedMs < $this->pingFreshnessMs;
+    }
+
+    /**
+     * Lightweight liveness probe: a connection that cannot answer the ping query
+     * is considered dead and will be recycled by the caller; one that answers is
+     * proven alive as of now.
+     */
+    private function verify(int $id, PDO $connection): bool
     {
         try {
             $statement = $connection->query($this->pingQuery);
@@ -362,11 +410,13 @@ final class PDOConnectionPool implements RelationalConnectionPoolInterface, Rese
                 // Free the probe's result buffer immediately.
                 $statement->closeCursor();
             }
-
-            return true;
         } catch (PDOException) {
             return false;
         }
+
+        $this->verifiedAt[$id] = microtime(true);
+
+        return true;
     }
 
     private function rollbackIfActive(PDO $connection): void
@@ -383,6 +433,6 @@ final class PDOConnectionPool implements RelationalConnectionPoolInterface, Rese
 
     private function discard(int $id): void
     {
-        unset($this->inUse[$id], $this->statements[$id], $this->issued[$id]);
+        unset($this->inUse[$id], $this->statements[$id], $this->issued[$id], $this->verifiedAt[$id]);
     }
 }

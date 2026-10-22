@@ -10,9 +10,11 @@ use Waffle\Commons\Contracts\Health\HealthCheckInterface;
 use Waffle\Commons\Contracts\Health\HealthResult;
 
 /**
- * Probes a connection pool for `/readyz` ([OPS-01], RFC-023 §3.3): it leases one connection and gives it
- * back. Leasing already pings (heal-on-lease), so the probe never opens a connection of its own and costs
- * one round trip. It serves the relational pool and the Redis pool alike.
+ * Probes a connection pool for `/readyz` ([OPS-01], RFC-023 §3.3): it leases one connection, asks it whether
+ * it is alive and gives it back. The lease pings on its own unless the pool's freshness window ([CARRY-01])
+ * lets a recently proven connection skip the ping, so the probe never trusts the lease alone; it never opens a
+ * connection of its own and costs one or two round trips. It serves the relational pool and the Redis pool
+ * alike.
  */
 final readonly class ConnectionPoolHealthCheck implements HealthCheckInterface
 {
@@ -45,8 +47,14 @@ final readonly class ConnectionPoolHealthCheck implements HealthCheckInterface
             return HealthResult::down('The pool could not lease a connection: ' . $e->getMessage());
         }
 
-        $this->pool->release($connection);
+        try {
+            $alive = $connection->isAlive();
+        } catch (Throwable $e) {
+            return HealthResult::down('The leased connection failed its liveness check: ' . $e->getMessage());
+        } finally {
+            $this->pool->release($connection);
+        }
 
-        return HealthResult::up();
+        return $alive ? HealthResult::up() : HealthResult::down('The leased connection failed its liveness check.');
     }
 }

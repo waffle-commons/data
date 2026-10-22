@@ -6,6 +6,7 @@ namespace WaffleTests\Commons\Data\Connection;
 
 use Closure;
 use PDO;
+use Pdo\Sqlite;
 use PDOException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use Waffle\Commons\Contracts\Data\Connection\ConnectionKind;
@@ -26,6 +27,31 @@ final class PDOConnectionPoolTest extends AbstractTestCase
     private function sqliteFactory(): Closure
     {
         return static fn(): PDO => new PDO('sqlite::memory:');
+    }
+
+    /**
+     * SQLite connections that count how often the pool probes them: the probe
+     * query `SELECT waffle_probe()` calls a function that bumps the counter.
+     *
+     * @return array{0: object{count: int}, 1: Closure(): PDO}
+     */
+    private function countingSqliteFactory(): array
+    {
+        $probes = new class {
+            public int $count = 0;
+        };
+        $factory = static function () use ($probes): PDO {
+            $pdo = new Sqlite('sqlite::memory:');
+            $pdo->createFunction('waffle_probe', static function () use ($probes): int {
+                ++$probes->count;
+
+                return 1;
+            });
+
+            return $pdo;
+        };
+
+        return [$probes, $factory];
     }
 
     public function testConstructorRejectsNonPositiveCeiling(): void
@@ -98,6 +124,78 @@ final class PDOConnectionPoolTest extends AbstractTestCase
         self::assertNotSame($dead->pdo(), $replacement->pdo());
         self::assertSame(0, $pool->idleCount());
         self::assertSame(1, $pool->activeCount());
+    }
+
+    public function testConstructorRejectsNegativePingFreshnessWindow(): void
+    {
+        $this->expectException(DatabaseException::class);
+
+        new PDOConnectionPool($this->sqliteFactory(), pingFreshnessMs: -1);
+    }
+
+    public function testWithoutAWindowEveryReDispenseIsPinged(): void
+    {
+        [$probes, $factory] = $this->countingSqliteFactory();
+        $pool = new PDOConnectionPool($factory, 8, 'SELECT waffle_probe()');
+
+        $pool->release($pool->acquire()); // fresh: connecting proved it alive
+        $pool->release($pool->acquire());
+        $pool->release($pool->acquire());
+
+        self::assertSame(2, $probes->count);
+    }
+
+    /**
+     * [CARRY-01]: the probe fails on every connection, so getting the same handle
+     * back proves the ping was skipped — connecting proved it alive well inside
+     * the window.
+     */
+    public function testConnectionProvenAliveWithinTheWindowSkipsThePing(): void
+    {
+        $pool = new PDOConnectionPool($this->sqliteFactory(), 8, 'SELECT 1 FROM ping_probe', pingFreshnessMs: 60_000);
+
+        $first = $pool->acquire();
+        $pool->release($first);
+        $second = $pool->acquire();
+
+        self::assertSame($first->pdo(), $second->pdo());
+    }
+
+    public function testConnectionProvenAliveLongerAgoThanTheWindowIsPingedAgain(): void
+    {
+        $pool = new PDOConnectionPool($this->sqliteFactory(), 8, 'SELECT 1 FROM ping_probe', pingFreshnessMs: 1);
+
+        $first = $pool->acquire();
+        $pool->release($first);
+        usleep(5_000);
+        $second = $pool->acquire();
+
+        // The ping ran, failed, and the dead handle was replaced.
+        self::assertNotSame($first->pdo(), $second->pdo());
+    }
+
+    public function testAnsweredPingStartsANewWindow(): void
+    {
+        [$probes, $factory] = $this->countingSqliteFactory();
+        $pool = new PDOConnectionPool($factory, 8, 'SELECT waffle_probe()', pingFreshnessMs: 200);
+
+        $pool->release($pool->acquire());
+        usleep(250_000);
+        $pool->release($pool->acquire()); // stale: pinged, answers, proven alive again
+        $pool->release($pool->acquire()); // inside the new window: not pinged
+
+        self::assertSame(1, $probes->count);
+    }
+
+    public function testResetKeepsTheWarmConnectionsProofOfLife(): void
+    {
+        $pool = new PDOConnectionPool($this->sqliteFactory(), 8, 'SELECT 1 FROM ping_probe', pingFreshnessMs: 60_000);
+
+        $first = $pool->acquire();
+        $pool->reset();
+        $second = $pool->acquire();
+
+        self::assertSame($first->pdo(), $second->pdo());
     }
 
     public function testResetRollsBackDanglingTransactionAndRecycles(): void

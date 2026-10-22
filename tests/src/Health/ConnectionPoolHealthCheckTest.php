@@ -15,9 +15,10 @@ use WaffleTests\Commons\Data\AbstractTestCase;
 #[CoversClass(ConnectionPoolHealthCheck::class)]
 final class ConnectionPoolHealthCheckTest extends AbstractTestCase
 {
-    public function testUpWhenThePoolLeasesAConnectionAndTakesItBack(): void
+    public function testUpWhenThePoolLeasesALiveConnectionAndTakesItBack(): void
     {
         $connection = $this->createStub(ConnectionInterface::class);
+        $connection->method('isAlive')->willReturn(true);
         $pool = $this->createMock(ConnectionPoolInterface::class);
         $pool->expects($this->once())->method('acquire')->willReturn($connection);
         $pool->expects($this->once())->method('release')->with($connection);
@@ -40,6 +41,38 @@ final class ConnectionPoolHealthCheckTest extends AbstractTestCase
 
         static::assertSame(HealthStatus::Down, $result->status);
         static::assertStringContainsString('Connection refused', $result->detail);
+    }
+
+    /**
+     * [CARRY-01]: inside the pool's freshness window a lease skips its ping, so a lease alone no longer
+     * proves the backend reachable — the probe asks the connection and still gives it back.
+     */
+    public function testDownWhenTheLeasedConnectionIsDead(): void
+    {
+        $connection = $this->createStub(ConnectionInterface::class);
+        $connection->method('isAlive')->willReturn(false);
+        $pool = $this->createMock(ConnectionPoolInterface::class);
+        $pool->expects($this->once())->method('acquire')->willReturn($connection);
+        $pool->expects($this->once())->method('release')->with($connection);
+
+        $result = new ConnectionPoolHealthCheck($pool)->check();
+
+        static::assertSame(HealthStatus::Down, $result->status);
+        static::assertStringContainsString('liveness check', $result->detail);
+    }
+
+    public function testDownWithTheReasonWhenTheLivenessCheckThrows(): void
+    {
+        $connection = $this->createStub(ConnectionInterface::class);
+        $connection->method('isAlive')->willThrowException(new RuntimeException('PING timed out'));
+        $pool = $this->createMock(ConnectionPoolInterface::class);
+        $pool->expects($this->once())->method('acquire')->willReturn($connection);
+        $pool->expects($this->once())->method('release')->with($connection);
+
+        $result = new ConnectionPoolHealthCheck($pool)->check();
+
+        static::assertSame(HealthStatus::Down, $result->status);
+        static::assertStringContainsString('PING timed out', $result->detail);
     }
 
     public function testNamedCriticalByDefaultAndConfigurable(): void

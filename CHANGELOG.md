@@ -5,7 +5,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Released in lockstep with the Waffle Commons umbrella tag.
 
-## [Unreleased]
+## [0.1.0-beta7] — 2026-11
+
+**Theme: shared limiter and breaker state, reversible migrations and the pool's ping freshness window.**
 
 ### Added
 - `Health\ConnectionPoolHealthCheck` (OPS-01, RFC-023 §3.3) — the `/readyz` probe for a connection pool: it leases one connection, asks it `isAlive()` and gives it back, so it costs one or two round trips and never opens a connection of its own. It asks the connection itself because a lease inside the pool's ping freshness window skips its ping. It serves the relational pool (`db.pool`) and the Redis pool alike; a pool that cannot lease, or a connection that fails or throws on `isAlive()`, is reported down with the reason, never thrown.

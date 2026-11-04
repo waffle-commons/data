@@ -14,6 +14,14 @@ Waffle Data Component
 
 The data & persistence layer for the Waffle Framework (RFC-022). Built for FrankenPHP resident-worker mode: a warm connection pool, a backend-agnostic query AST, parameterized SQL / Firestore compilers, a property-hook hydrator, and a stateless SQL migration runner. **No stateful ORM, no identity map, no change tracking** — a row becomes an immutable value object and nothing more.
 
+## 🆕 Beta-7 — shared limiter and breaker state, pool probe, reversible migrations
+
+- **`RateLimit\RedisLimiterStateStorage`** (NET-01) holds the token buckets behind `LimiterStateStorageInterface`: one Lua script refills and takes atomically on the Redis server clock, through the framework's Redis pool. Measured with 8 concurrent processes making 200 calls on a bucket of 50: exactly 50 admitted.
+- **`CircuitBreaker\RedisCircuitStateStorage`** (NET-03) holds the circuits behind `CircuitStateStorageInterface`: `acquire()` and `record()` are each one Lua script (closed → open at the failure-rate threshold, open → half-open after the cool-down with bounded trial calls). Both storages fail as `RateLimit\StateStorageException`, which the limiter and the breaker turn into their failure mode.
+- **`Health\ConnectionPoolHealthCheck`** (OPS-01) is the `/readyz` probe for a pool: it leases one connection, asks it `isAlive()` and gives it back, so it costs one or two round trips and never opens a connection of its own. A pool that cannot lease is reported down with the reason, never thrown.
+- **Ping freshness window** (CARRY-01): `PDOConnectionPool`'s `pingFreshnessMs` (default `0`, a probe on every lease) skips the `SELECT 1` for a connection proven alive within that many milliseconds.
+- **Reversible migrations** (OPS-03): `MigrationRunner::rollback()` and `status()`, below. DDL migrations work on MySQL and MariaDB again, whose DDL commits implicitly.
+
 ## 📦 Installation
 
 ```bash
@@ -40,7 +48,10 @@ Requires PHP 8.5+ and `ext-pdo`. Depends only on `waffle-commons/contracts` (plu
 | `Waffle\Commons\Data\Evaluation\InMemoryEvaluator` | Stateless fetch-then-filter evaluation (range/set/sort/offset) for backends with restricted server-side querying. |
 | `Waffle\Commons\Data\Storage\JsonFileStore` | Atomic flat-file JSON store (read-modify-write under `LOCK_EX`). |
 | `Waffle\Commons\Data\Hydrator\PropertyHookHydrator` | Maps a raw row onto an immutable DTO via its constructor; corrupt data is rejected by the DTO's PHP 8.5 `set` hooks as a `ValidationExceptionInterface`. |
-| `Waffle\Commons\Data\Migration\MigrationRunner` | `MigrationRunnerInterface` — applies versioned `*.sql` files in order, tracked in `waffle_migrations`; each migration runs in its own transaction. |
+| `Waffle\Commons\Data\Migration\MigrationRunner` | `MigrationRunnerInterface` — applies versioned `*.sql` files in order, tracked in `waffle_migrations`; each migration runs in its own transaction. `rollback()` and `status()` since Beta-7. |
+| `Waffle\Commons\Data\RateLimit\RedisLimiterStateStorage` | `LimiterStateStorageInterface` on Redis: atomic token buckets shared by every worker (*Beta-7*, NET-01). |
+| `Waffle\Commons\Data\CircuitBreaker\RedisCircuitStateStorage` | `CircuitStateStorageInterface` on Redis: shared circuit state for the HTTP client's breaker (*Beta-7*, NET-03). |
+| `Waffle\Commons\Data\Health\ConnectionPoolHealthCheck` | `HealthCheckInterface` for a connection pool, for `/readyz` (*Beta-7*, OPS-01). |
 | `Waffle\Commons\Data\Warmup\QueryWarmer` | `DataWarmerInterface` — pre-compiles named SQR trees into an atomic `<?php return […]` artifact primed into OPcache (`bin/waffle data:warmup`, Beta-3). |
 | `Waffle\Commons\Data\Exception\DatabaseException` | `DatabaseExceptionInterface` — wraps any backend failure, lifts the ANSI `SQLSTATE` from a `PDOException`. |
 | `Waffle\Commons\Data\Exception\ValidationException` | `ValidationExceptionInterface` — a field-aware hydration/validation failure (surfaces as RFC 7807 `422`). |
@@ -142,6 +153,7 @@ Central framework docs (Diátaxis) for this component:
 
 - Reference: [`reference/data.md`](https://github.com/waffle-commons/documentation/blob/main/reference/data.md), [`reference/connection-pool.md`](https://github.com/waffle-commons/documentation/blob/main/reference/connection-pool.md)
 - Explanation: [`explanation/data-persistence.md`](https://github.com/waffle-commons/documentation/blob/main/explanation/data-persistence.md), [`explanation/connection-pooling.md`](https://github.com/waffle-commons/documentation/blob/main/explanation/connection-pooling.md)
+- How-to: [`how-to/rate-limit-requests.md`](https://github.com/waffle-commons/documentation/blob/main/how-to/rate-limit-requests.md), [`how-to/make-outbound-calls-resilient.md`](https://github.com/waffle-commons/documentation/blob/main/how-to/make-outbound-calls-resilient.md), [`how-to/run-on-kubernetes.md`](https://github.com/waffle-commons/documentation/blob/main/how-to/run-on-kubernetes.md)
 - Full documentation tree: [waffle-commons/documentation](https://github.com/waffle-commons/documentation)
 
 ## 📄 License

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Waffle\Commons\Data\Driver\KeyValue;
 
+use IgorPhp\IgorBundle\Attribute\WorkerSafe;
 use Redis;
 use RedisException;
 use Waffle\Commons\Data\Exception\DatabaseException;
@@ -78,6 +79,9 @@ final class RedisKeyValueClient implements KeyValueClientInterface
      * @throws DatabaseException When the Redis call fails.
      */
     #[\Override]
+    #[WorkerSafe(
+        reason: 'writes through the injected Redis client to the backend by design; no worker memory is mutated',
+    )]
     public function set(string $key, string $value): void
     {
         try {

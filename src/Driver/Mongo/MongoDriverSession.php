@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Waffle\Commons\Data\Driver\Mongo;
 
+use IgorPhp\IgorBundle\Attribute\WorkerSafe;
 use MongoDB\Driver\BulkWrite;
 use MongoDB\Driver\Exception\Exception as MongoDriverException;
 use MongoDB\Driver\Manager;
@@ -39,6 +40,9 @@ final class MongoDriverSession implements MongoSessionInterface
      *         scalar row.
      */
     #[\Override]
+    #[WorkerSafe(
+        reason: 'the cursor is created by this call for this query only; setTypeMap() configures that local cursor',
+    )]
     public function find(CompiledMongoQuery $query): array
     {
         $options = $this->options($query);

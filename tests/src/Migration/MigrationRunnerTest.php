@@ -4,14 +4,20 @@ declare(strict_types=1);
 
 namespace WaffleTests\Commons\Data\Migration;
 
+use InvalidArgumentException;
 use PDO;
 use PHPUnit\Framework\Attributes\CoversClass;
 use Waffle\Commons\Contracts\Config\ConfigInterface;
+use Waffle\Commons\Contracts\Data\Migration\Enum\MigrationStatus;
+use Waffle\Commons\Contracts\Data\Migration\MigrationState;
+use Waffle\Commons\Data\Compiler\SQLDialect;
 use Waffle\Commons\Data\Connection\PDOConnectionPool;
 use Waffle\Commons\Data\Exception\DatabaseException;
 use Waffle\Commons\Data\Migration\MigrationRunner;
 use WaffleTests\Commons\Data\AbstractTestCase;
+use WaffleTests\Commons\Data\Fixture\MigrationsPathConfig;
 
+use function array_map;
 use function file_put_contents;
 use function glob;
 use function is_dir;
@@ -124,6 +130,40 @@ final class MigrationRunnerTest extends AbstractTestCase
         self::assertTrue($this->tableExists($pdo, 'ok'));
     }
 
+    public function testAScriptWithOnlyCommentsIsRefusedAndNeverRecorded(): void
+    {
+        $this->writeMigration('001_users.sql', 'CREATE TABLE users (id INTEGER PRIMARY KEY);');
+        $this->writeMigration('002_unedited.sql', "-- 002_unedited (up)\n/* to be written */\n;\n");
+
+        $pdo = $this->sqlite();
+        $runner = new MigrationRunner($this->poolFor($pdo), $this->configFor($this->migrationsDir));
+
+        try {
+            $runner->run();
+            self::fail('Expected a DatabaseException for the script without a statement.');
+        } catch (DatabaseException $exception) {
+            self::assertStringContainsString('002_unedited.sql" holds no SQL statement', $exception->getMessage());
+        }
+
+        self::assertSame(['001_users'], $this->loggedVersions($pdo));
+    }
+
+    public function testCommentsAroundAStatementDoNotHideIt(): void
+    {
+        $this->writeMigration(
+            '001_notes.sql',
+            "-- header\n/* block\n comment */ CREATE TABLE notes (body TEXT);\n"
+            . "INSERT INTO notes (body) VALUES ('a -- b /* c'); -- trailing\n",
+        );
+
+        $pdo = $this->sqlite();
+        $runner = new MigrationRunner($this->poolFor($pdo), $this->configFor($this->migrationsDir));
+
+        self::assertSame(['001_notes'], $runner->run());
+        $statement = $pdo->query('SELECT body FROM notes');
+        self::assertSame('a -- b /* c', $statement === false ? null : $statement->fetchColumn());
+    }
+
     public function testEmptyDirectoryProvisionsLogButAppliesNothing(): void
     {
         $pdo = $this->sqlite();
@@ -139,6 +179,205 @@ final class MigrationRunnerTest extends AbstractTestCase
         $runner = new MigrationRunner($this->poolFor($pdo), $this->configFor($this->migrationsDir . '/nope'));
 
         self::assertSame([], $runner->run());
+    }
+
+    public function testDownScriptsAreNeverAppliedAsVersions(): void
+    {
+        $this->writeMigration('001_users.sql', 'CREATE TABLE users (id INTEGER PRIMARY KEY);');
+        $this->writeMigration('001_users.down.sql', 'DROP TABLE users;');
+
+        $pdo = $this->sqlite();
+        $runner = new MigrationRunner($this->poolFor($pdo), $this->configFor($this->migrationsDir));
+
+        self::assertSame(['001_users'], $runner->run());
+        self::assertSame(['001_users'], $this->loggedVersions($pdo));
+    }
+
+    public function testRollbackRevertsTheHighestVersionAndErasesItFromTheLog(): void
+    {
+        $pdo = $this->sqlite();
+        $runner = $this->migratedPair($pdo);
+
+        $reported = [];
+        $reverted = $runner->rollback(onReverted: static function (string $version) use (&$reported): void {
+            $reported[] = $version;
+        });
+
+        self::assertSame(['002_posts'], $reverted);
+        self::assertSame(['002_posts'], $reported);
+        self::assertFalse($this->tableExists($pdo, 'posts'));
+        self::assertTrue($this->tableExists($pdo, 'users'));
+        self::assertSame(['001_users'], $this->loggedVersions($pdo));
+    }
+
+    public function testRollbackOfSeveralStepsRunsInReverseVersionOrder(): void
+    {
+        $pdo = $this->sqlite();
+        $runner = $this->migratedPair($pdo);
+
+        self::assertSame(['002_posts', '001_users'], $runner->rollback(5));
+        self::assertFalse($this->tableExists($pdo, 'users'));
+        self::assertSame([], $this->loggedVersions($pdo));
+        self::assertSame([], $runner->rollback());
+    }
+
+    public function testRolledBackVersionsApplyAgain(): void
+    {
+        $pdo = $this->sqlite();
+        $runner = $this->migratedPair($pdo);
+        $runner->rollback(2);
+
+        self::assertSame(['001_users', '002_posts'], $runner->run());
+        self::assertTrue($this->tableExists($pdo, 'posts'));
+    }
+
+    public function testRollbackRevertsNothingWhenOneTargetHasNoDownScript(): void
+    {
+        $this->writeMigration('001_users.sql', 'CREATE TABLE users (id INTEGER PRIMARY KEY);');
+        $this->writeMigration('002_posts.sql', 'CREATE TABLE posts (id INTEGER PRIMARY KEY);');
+        $this->writeMigration('002_posts.down.sql', 'DROP TABLE posts;');
+
+        $pdo = $this->sqlite();
+        $runner = new MigrationRunner($this->poolFor($pdo), $this->configFor($this->migrationsDir));
+        $runner->run();
+
+        try {
+            $runner->rollback(2);
+            self::fail('Expected a DatabaseException for the version without a down script.');
+        } catch (DatabaseException $exception) {
+            self::assertStringContainsString('001_users.down.sql', $exception->getMessage());
+        }
+
+        // 002 had a down script, but the check runs before anything is reverted.
+        self::assertTrue($this->tableExists($pdo, 'posts'));
+        self::assertSame(['001_users', '002_posts'], $this->loggedVersions($pdo));
+    }
+
+    public function testRollbackRevertsNothingWhenOneTargetDownScriptIsEmpty(): void
+    {
+        $pdo = $this->sqlite();
+        $runner = $this->migratedPair($pdo);
+        $this->writeMigration('001_users.down.sql', "-- 001_users (down)\n");
+
+        try {
+            $runner->rollback(2);
+            self::fail('Expected a DatabaseException for the empty down script.');
+        } catch (DatabaseException $exception) {
+            self::assertStringContainsString('001_users.down.sql" holds no SQL statement', $exception->getMessage());
+        }
+
+        // 002's down script was valid, but every target is read before anything is reverted.
+        self::assertTrue($this->tableExists($pdo, 'posts'));
+        self::assertSame(['001_users', '002_posts'], $this->loggedVersions($pdo));
+    }
+
+    public function testRollbackRefusesAVersionWhoseScriptIsGone(): void
+    {
+        $pdo = $this->sqlite();
+        $runner = $this->migratedPair($pdo);
+        unlink($this->migrationsDir . '/002_posts.sql');
+
+        $this->expectException(DatabaseException::class);
+        $this->expectExceptionMessage('no longer on disk');
+
+        $runner->rollback();
+    }
+
+    public function testAFailingDownScriptIsRolledBackAndKeepsTheVersionApplied(): void
+    {
+        $this->writeMigration('001_users.sql', 'CREATE TABLE users (id INTEGER PRIMARY KEY);');
+        $this->writeMigration('001_users.down.sql', 'DROP TABLE users; NOT VALID SQL;');
+
+        $pdo = $this->sqlite();
+        $runner = new MigrationRunner($this->poolFor($pdo), $this->configFor($this->migrationsDir));
+        $runner->run();
+
+        try {
+            $runner->rollback();
+            self::fail('Expected a DatabaseException for the broken down script.');
+        } catch (DatabaseException $exception) {
+            self::assertStringContainsString('Rollback of "001_users" failed', $exception->getMessage());
+        }
+
+        self::assertTrue($this->tableExists($pdo, 'users'));
+        self::assertSame(['001_users'], $this->loggedVersions($pdo));
+    }
+
+    public function testRollbackNeedsAtLeastOneStep(): void
+    {
+        $runner = new MigrationRunner($this->poolFor($this->sqlite()), $this->configFor($this->migrationsDir));
+
+        $this->expectException(InvalidArgumentException::class);
+
+        $runner->rollback(0);
+    }
+
+    public function testStatusReportsAppliedPendingAndMissingVersions(): void
+    {
+        $pdo = $this->sqlite();
+        $runner = $this->migratedPair($pdo);
+        $this->writeMigration('003_tags.sql', 'CREATE TABLE tags (id INTEGER PRIMARY KEY);');
+        unlink($this->migrationsDir . '/001_users.sql');
+        unlink($this->migrationsDir . '/001_users.down.sql');
+
+        $report = array_map(static fn(MigrationState $state): array => [
+            $state->version,
+            $state->status,
+            $state->reversible,
+            $state->appliedAt !== null,
+        ], $runner->status());
+
+        self::assertSame(
+            [
+                ['001_users', MigrationStatus::Missing, false, true],
+                ['002_posts', MigrationStatus::Applied, true,  true],
+                ['003_tags',  MigrationStatus::Pending, false, false],
+            ],
+            $report,
+        );
+    }
+
+    public function testStatusOfAnEmptyProjectIsEmpty(): void
+    {
+        $runner = new MigrationRunner($this->poolFor($this->sqlite()), $this->configFor($this->migrationsDir));
+
+        self::assertSame([], $runner->status());
+    }
+
+    public function testAnExplicitDialectOverridesTheDriverName(): void
+    {
+        $this->writeMigration('001_users.sql', 'CREATE TABLE users (id INTEGER PRIMARY KEY);');
+
+        $pdo = $this->sqlite();
+        $runner = new MigrationRunner($this->poolFor($pdo), $this->configFor($this->migrationsDir), SQLDialect::SQLite);
+
+        self::assertSame(['001_users'], $runner->run());
+    }
+
+    public function testAnUnreadableLogSurfacesAsADatabaseException(): void
+    {
+        $pdo = $this->sqlite();
+        // A log table without the applied_at column cannot answer the ledger query.
+        $pdo->exec('CREATE TABLE waffle_migrations (version VARCHAR(255) PRIMARY KEY)');
+        $runner = new MigrationRunner($this->poolFor($pdo), $this->configFor($this->migrationsDir));
+
+        $this->expectException(DatabaseException::class);
+        $this->expectExceptionMessage('Unable to read the migration log.');
+
+        $runner->status();
+    }
+
+    private function migratedPair(PDO $pdo): MigrationRunner
+    {
+        $this->writeMigration('001_users.sql', 'CREATE TABLE users (id INTEGER PRIMARY KEY);');
+        $this->writeMigration('001_users.down.sql', 'DROP TABLE users;');
+        $this->writeMigration('002_posts.sql', 'CREATE TABLE posts (id INTEGER PRIMARY KEY);');
+        $this->writeMigration('002_posts.down.sql', 'DROP TABLE posts;');
+
+        $runner = new MigrationRunner($this->poolFor($pdo), $this->configFor($this->migrationsDir));
+        $runner->run();
+
+        return $runner;
     }
 
     private function writeMigration(string $name, string $sql): void
@@ -162,44 +401,7 @@ final class MigrationRunnerTest extends AbstractTestCase
 
     private function configFor(string $migrationsPath): ConfigInterface
     {
-        return new class($migrationsPath) implements ConfigInterface {
-            public function __construct(
-                private readonly string $migrationsPath,
-            ) {}
-
-            #[\Override]
-            public function getInt(string $key, ?int $default = null): ?int
-            {
-                return $default;
-            }
-
-            #[\Override]
-            public function getString(string $key, ?string $default = null): ?string
-            {
-                if ($key === 'waffle.database.migrations_path') {
-                    return $this->migrationsPath;
-                }
-
-                return $default;
-            }
-
-            /**
-             * @param array<array-key, mixed>|null $default
-             *
-             * @return array<array-key, mixed>|null
-             */
-            #[\Override]
-            public function getArray(string $key, ?array $default = null): ?array
-            {
-                return $default;
-            }
-
-            #[\Override]
-            public function getBool(string $key, ?bool $default = null): ?bool
-            {
-                return $default;
-            }
-        };
+        return new MigrationsPathConfig($migrationsPath);
     }
 
     private function tableExists(PDO $pdo, string $table): bool

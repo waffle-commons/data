@@ -27,6 +27,8 @@ psr = ["Psr\\**"]
 [[guard.perimeter.rules]]
 namespace = "Waffle\\Commons\\Data"
 permit = [
+    # Worker-safety audit tooling (igor-php): dev-only #[WorkerSafe] metadata, inert at runtime.
+    "IgorPhp\\IgorBundle\\Attribute\\**",
     "Waffle\\Commons\\Data\\**",
     "Waffle\\Commons\\Contracts\\**",
     # PHP's MongoDB driver extension lives in a namespaced (non-global) root;

@@ -5,6 +5,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Released in lockstep with the Waffle Commons umbrella tag.
 
+## [0.1.0-beta7] — 2026-11
+
+**Theme: shared limiter and breaker state, reversible migrations and the pool's ping freshness window.**
+
+### Added
+- `Health\ConnectionPoolHealthCheck` (OPS-01, RFC-023 §3.3) — the `/readyz` probe for a connection pool: it leases one connection, asks it `isAlive()` and gives it back, so it costs one or two round trips and never opens a connection of its own. It asks the connection itself because a lease inside the pool's ping freshness window skips its ping. It serves the relational pool (`db.pool`) and the Redis pool alike; a pool that cannot lease, or a connection that fails or throws on `isAlive()`, is reported down with the reason, never thrown.
+- **Ping freshness window (CARRY-01):** `PDOConnectionPool`'s new `pingFreshnessMs` argument (default `0`, today's behaviour) dispenses a connection without the `SELECT 1` probe when it was proven alive — connected, or answered the probe — less than that many milliseconds ago; an older one is probed and, if dead, replaced as before. Under PostgreSQL the probe is two round trips (pdo_pgsql prepares it), half of a pooled read's database work. The trade-off: when the database drops its connections, requests can fail for up to the window after a connection was last proven alive. Only a proof counts — a connection coming back from a lease is not proven alive, since the pool never sees the caller's errors.
+- `RateLimit\RedisLimiterStateStorage` (NET-01, RFC-024 §5.1) — the shared token buckets behind `LimiterStateStorageInterface`: one Lua script refills and takes atomically on the Redis server clock, through the framework's Redis pool. Measured on 2026-10-17: 8 concurrent processes, 200 calls on a bucket of 50 → exactly 50 admitted. Failures surface as `RateLimit\StateStorageException` (implements `StateStorageExceptionInterface`).
+- `CircuitBreaker\RedisCircuitStateStorage` (NET-03, RFC-024 §3.2) — the shared circuit state behind `CircuitStateStorageInterface`: `acquire()` and `record()` are each one Lua script on the Redis server clock (closed → open at the failure-rate threshold over a window, open → half-open after the cool-down with a bounded number of trial calls, a trial success closes, a trial failure reopens). Same pool and same `StateStorageException` as the rate limiter. Trials that record no outcome within a cool-down give their slots back (`trial_at`), so a worker that died mid-call, or a call whose outcome says nothing about the upstream, never holds the circuit half-open, refusing every call, until the hash expires.
+- **Reversible migrations (OPS-03, RFC-014):** `MigrationRunner::rollback()` reverts the most recent versions (highest first) through their `V.down.sql` scripts, each in its own transaction, and checks every target before it reverts any; `status()` reports each version as applied, pending or missing, with whether it is reversible and its ledger instant. `V.down.sql` files are never applied as versions.
+- `MigrationRunner` refuses a script with no SQL statement, only `--` / `/* */` comments, blank lines or semicolons, before it opens a transaction. PostgreSQL and SQLite run such a script as a no-op, so a file scaffolded by `make:migration` and left unedited would have been logged as applied, or its version as reverted. `rollback()` reads every targeted down script first, so an empty one stops it before anything is reverted.
+- `Migration\MigrationLedger` — the `waffle_migrations` SQL per dialect: SQL Server guards the `CREATE TABLE` with `OBJECT_ID` and uses `DATETIME2` (its `TIMESTAMP` is a row-version), Oracle runs a PL/SQL block that ignores only ORA-00955. The runner reads the dialect from the PDO driver name, or takes one as its third argument.
+
+### Fixed
+- `MigrationRunner` failed every DDL migration on MySQL and MariaDB: their DDL commits implicitly, so PHP 8's `commit()` threw "There is no active transaction" after the script had run and its ledger row had been written. The runner now commits only while a transaction is still open. Proven live: the migrate → status → rollback round trip runs on PostgreSQL, MySQL 8.4 and MariaDB 11.4 (`MigrationRoundTripTest`), SQLite in the unit suite.
+
 ## [0.1.0-beta6] — 2026-09
 
 **Theme: identifier-quoting hardening.**
